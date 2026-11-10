@@ -229,7 +229,9 @@ function renderManage(res: Response, token: string, flash: Flash): void {
     res.status(404).type('html').send(
       noticePage({
         title: 'Link not valid',
-        message: 'That link is not valid or has expired. Sign up again to get a new one.',
+        message:
+          'That link is not valid or has expired. Manage links last 30 days; use the one in your ' +
+          'latest digest email, or sign up again to get a new one.',
         kind: 'err',
       }),
     );
@@ -261,7 +263,13 @@ publicRouter.post(
     const subscriber = subscriberFromToken(token, 'manage');
     if (!subscriber) {
       res.status(404).type('html').send(
-        noticePage({ title: 'Link not valid', message: 'That link is not valid.', kind: 'err' }),
+        noticePage({
+        title: 'Link not valid',
+        message:
+          'That link is not valid or has expired. Manage links last 30 days; use the one in your ' +
+          'latest digest email, or sign up again to get a new one.',
+        kind: 'err',
+      }),
       );
       return;
     }
@@ -288,7 +296,13 @@ publicRouter.post('/manage/:token/sources/:id/delete', (req, res) => {
   const subscriber = subscriberFromToken(token, 'manage');
   if (!subscriber) {
     res.status(404).type('html').send(
-      noticePage({ title: 'Link not valid', message: 'That link is not valid.', kind: 'err' }),
+      noticePage({
+        title: 'Link not valid',
+        message:
+          'That link is not valid or has expired. Manage links last 30 days; use the one in your ' +
+          'latest digest email, or sign up again to get a new one.',
+        kind: 'err',
+      }),
     );
     return;
   }
@@ -309,7 +323,13 @@ publicRouter.post('/manage/:token/schedule', (req, res) => {
   const subscriber = subscriberFromToken(token, 'manage');
   if (!subscriber) {
     res.status(404).type('html').send(
-      noticePage({ title: 'Link not valid', message: 'That link is not valid.', kind: 'err' }),
+      noticePage({
+        title: 'Link not valid',
+        message:
+          'That link is not valid or has expired. Manage links last 30 days; use the one in your ' +
+          'latest digest email, or sign up again to get a new one.',
+        kind: 'err',
+      }),
     );
     return;
   }
@@ -350,7 +370,13 @@ publicRouter.post('/manage/:token/unsubscribe', (req, res) => {
   const subscriber = subscriberFromToken(req.params.token as string, 'manage');
   if (!subscriber) {
     res.status(404).type('html').send(
-      noticePage({ title: 'Link not valid', message: 'That link is not valid.', kind: 'err' }),
+      noticePage({
+        title: 'Link not valid',
+        message:
+          'That link is not valid or has expired. Manage links last 30 days; use the one in your ' +
+          'latest digest email, or sign up again to get a new one.',
+        kind: 'err',
+      }),
     );
     return;
   }

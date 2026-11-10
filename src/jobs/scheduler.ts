@@ -41,15 +41,27 @@ export function startScheduler(): void {
     return;
   }
 
-  // The sweep itself is timezone-agnostic: it just asks which subscribers have
-  // reached their own send hour. A sweep with nobody due does no work, so it
-  // can run often enough to serve offsets that are not whole hours.
-  cron.schedule(config.DIGEST_SWEEP_CRON, () => void runGuarded('sweep'), {
-    timezone: config.TZ,
-  });
+  try {
+    // The sweep itself is timezone-agnostic: it just asks which subscribers
+    // have reached their own send hour. A sweep with nobody due does no work,
+    // so it can run often enough to serve offsets that are not whole hours.
+    cron.schedule(config.DIGEST_SWEEP_CRON, () => void runGuarded('sweep'), {
+      timezone: config.TZ,
+    });
 
-  // Hourly housekeeping of expired admin sessions.
-  cron.schedule('17 * * * *', () => purgeExpiredSessions(), { timezone: config.TZ });
+    // Hourly housekeeping of expired admin sessions.
+    cron.schedule('17 * * * *', () => purgeExpiredSessions(), { timezone: config.TZ });
+  } catch (error) {
+    // node-cron rejects an unrecognised timezone by throwing. config validates
+    // TZ already, so this should be unreachable — but a scheduling failure must
+    // not take the web server down with it.
+    log.error('scheduler could not be started; digests will not be sent automatically', {
+      sweep: config.DIGEST_SWEEP_CRON,
+      timezone: config.TZ,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
 
   log.info('scheduler started', {
     sweep: config.DIGEST_SWEEP_CRON,

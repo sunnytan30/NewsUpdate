@@ -170,18 +170,34 @@ try {
   process.exit(1);
 }
 
-/** The timezone given to a subscriber who does not choose one. */
-const defaultTimezone = (() => {
-  const candidate = raw.DEFAULT_TIMEZONE?.trim() || raw.TZ.trim();
+const FALLBACK_TIMEZONE = 'Asia/Singapore';
+
+/**
+ * Resolve a timezone setting, failing loudly in production.
+ *
+ * TZ is validated as well as DEFAULT_TIMEZONE, because the scheduler passes it
+ * to node-cron, which rejects an unrecognised zone by throwing. Catching it
+ * here gives a clear message at startup instead of an opaque crash.
+ */
+function resolveConfiguredTimezone(field: string, candidate: string): string {
   if (isValidTimeZone(candidate)) return candidate;
-  const field = raw.DEFAULT_TIMEZONE ? 'DEFAULT_TIMEZONE' : 'TZ';
   if (isProd) {
     console.error(`${field} is not a recognised IANA timezone: ${candidate}`);
     process.exit(1);
   }
-  console.warn(`[config] ${field} ("${candidate}") is not recognised; falling back to Asia/Singapore.`);
-  return 'Asia/Singapore';
-})();
+  console.warn(
+    `[config] ${field} ("${candidate}") is not recognised; falling back to ${FALLBACK_TIMEZONE}.`,
+  );
+  return FALLBACK_TIMEZONE;
+}
+
+/** Process timezone, used for log timestamps and the housekeeping schedule. */
+const processTimezone = resolveConfiguredTimezone('TZ', raw.TZ.trim());
+
+/** The timezone given to a subscriber who does not choose one. */
+const defaultTimezone = raw.DEFAULT_TIMEZONE?.trim()
+  ? resolveConfiguredTimezone('DEFAULT_TIMEZONE', raw.DEFAULT_TIMEZONE.trim())
+  : processTimezone;
 
 export const config = {
   ...raw,
@@ -191,6 +207,8 @@ export const config = {
   /** Normalised admin mount path, without a trailing slash. */
   ADMIN_PATH: raw.ADMIN_PATH.replace(/\/+$/, '') || '/console',
   ADMIN_EMAIL: raw.ADMIN_EMAIL.trim().toLowerCase(),
+  // Both validated above, so the scheduler can hand them to node-cron safely.
+  TZ: processTimezone,
   DEFAULT_TIMEZONE: defaultTimezone,
 };
 

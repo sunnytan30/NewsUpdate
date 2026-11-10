@@ -9,6 +9,7 @@ import {
   isFieldEncryptionReady,
   keyFingerprint,
 } from '../src/util/encryption.js';
+import { signedToken } from '../src/util/crypto.js';
 import {
   checkPin,
   emailIndex,
@@ -228,6 +229,55 @@ describe('signed links', () => {
     const subscriber = activeSubscriber();
     expect(subscriberFromToken(manageToken(subscriber), 'manage')?.id).toBe(subscriber.id);
     expect(subscriberFromToken(unsubscribeToken(subscriber), 'unsub')?.id).toBe(subscriber.id);
+  });
+
+  it('expires a manage link after its window, but never an unsubscribe link', () => {
+    const subscriber = activeSubscriber();
+    const issued = new Date('2026-01-01T00:00:00Z');
+    const manage = manageToken(subscriber, issued);
+    const unsub = unsubscribeToken(subscriber);
+
+    const withinWindow = new Date(issued.getTime() + 29 * 24 * 3600_000);
+    const pastWindow = new Date(issued.getTime() + 31 * 24 * 3600_000);
+
+    expect(subscriberFromToken(manage, 'manage', withinWindow)?.id).toBe(subscriber.id);
+    expect(subscriberFromToken(manage, 'manage', pastWindow)).toBeNull();
+
+    // Someone must always be able to stop unwanted mail, however old.
+    const yearsLater = new Date(issued.getTime() + 3 * 365 * 24 * 3600_000);
+    expect(subscriberFromToken(unsub, 'unsub', yearsLater)?.id).toBe(subscriber.id);
+  });
+
+  it('refuses a manage token with no issued-at, so the check cannot be skipped', () => {
+    const subscriber = activeSubscriber();
+    // A token in the old three-field shape must not be accepted.
+    const legacy = signedToken(`manage:${subscriber.id}:${subscriber.email_index.slice(0, 32)}`);
+    expect(subscriberFromToken(legacy, 'manage')).toBeNull();
+  });
+
+  it('refuses a manage token issued implausibly far in the future', () => {
+    const subscriber = activeSubscriber();
+    const future = new Date(Date.now() + 10 * 24 * 3600_000);
+    expect(subscriberFromToken(manageToken(subscriber, future), 'manage')).toBeNull();
+  });
+
+  it('tolerates a small amount of clock skew', () => {
+    const subscriber = activeSubscriber();
+    const slightlyAhead = new Date(Date.now() + 60_000);
+    expect(subscriberFromToken(manageToken(subscriber, slightlyAhead), 'manage')?.id).toBe(
+      subscriber.id,
+    );
+  });
+
+  it('refuses a manage token whose issued-at was tampered with', () => {
+    const subscriber = activeSubscriber();
+    const token = manageToken(subscriber, new Date('2026-01-01T00:00:00Z'));
+    const payload = Buffer.from(token.split('.')[0] as string, 'base64url').toString('utf8');
+    const forged = payload.replace(/:\d+$/, `:${Math.floor(Date.now() / 1000)}`);
+    // Re-encoding the payload without re-signing must fail the signature check.
+    const reassembled =
+      Buffer.from(forged, 'utf8').toString('base64url') + '.' + (token.split('.')[1] as string);
+    expect(subscriberFromToken(reassembled, 'manage')).toBeNull();
   });
 
   it('stops working if the stored address changes', () => {

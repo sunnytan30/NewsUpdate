@@ -476,10 +476,28 @@ function linkBinding(subscriber: Subscriber): string {
   return subscriber.email_index.slice(0, 32);
 }
 
-export function manageToken(subscriber: Subscriber): string {
-  return signedToken(`manage:${subscriber.id}:${linkBinding(subscriber)}`);
+/**
+ * How long a manage link stays usable.
+ *
+ * The link needs an expiry because it is bearer access: anyone holding the URL
+ * can see the subscriber's address and change their sources. It travels through
+ * email, so it also ends up in mail logs, forwarded messages and browser
+ * history. A fresh one goes out with every digest, so a 30-day window is
+ * invisible in normal use, and an old leaked link stops working.
+ */
+export const MANAGE_TOKEN_TTL_DAYS = 30;
+
+export function manageToken(subscriber: Subscriber, issuedAt = new Date()): string {
+  const issued = Math.floor(issuedAt.getTime() / 1000);
+  return signedToken(`manage:${subscriber.id}:${linkBinding(subscriber)}:${issued}`);
 }
 
+/**
+ * Unsubscribe links deliberately never expire. Someone must always be able to
+ * stop mail they did not ask for, including from a message months old, and
+ * RFC 8058 one-click unsubscribe depends on the link in that message still
+ * working. The token grants nothing but unsubscribing.
+ */
 export function unsubscribeToken(subscriber: Subscriber): string {
   return signedToken(`unsub:${subscriber.id}:${linkBinding(subscriber)}`);
 }
@@ -488,13 +506,29 @@ export function unsubscribeToken(subscriber: Subscriber): string {
 export function subscriberFromToken(
   token: string,
   expected: 'manage' | 'unsub',
+  now = new Date(),
 ): Subscriber | null {
   const payload = verifySignedToken(token);
   if (!payload) return null;
-  const [purpose, idPart, bindingPart] = payload.split(':');
+
+  const [purpose, idPart, bindingPart, issuedPart] = payload.split(':');
   if (purpose !== expected) return null;
+
   const id = Number(idPart);
   if (!Number.isInteger(id)) return null;
+
+  if (expected === 'manage') {
+    // Issued-at is required, so a pre-expiry token cannot be replayed to skip
+    // the check by simply omitting the field.
+    if (issuedPart === undefined) return null;
+    const issued = Number(issuedPart);
+    if (!Number.isInteger(issued) || issued <= 0) return null;
+    const ageMs = now.getTime() - issued * 1000;
+    // A small negative age is tolerated for clock skew; a large one is not.
+    if (ageMs < -5 * 60_000) return null;
+    if (ageMs > MANAGE_TOKEN_TTL_DAYS * 24 * 3600_000) return null;
+  }
+
   const subscriber = findById(id);
   if (!subscriber) return null;
   // Binding to the index means the link stops working if the address changes.

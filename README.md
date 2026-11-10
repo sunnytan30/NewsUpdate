@@ -189,8 +189,22 @@ matter most:
 | `DEFAULT_SOURCE_LIMIT` | Starting quota. The admin console overrides it, globally and per subscriber |
 | `ALLOW_PRIVATE_NETWORK` | Leave `false`. `true` disables the SSRF guard |
 
-Run it behind TLS. Set `TRUST_PROXY=true` behind nginx, Caddy or Cloudflare so
-client IPs and secure-cookie detection work; leave `INSECURE_COOKIES=false`.
+Run it behind TLS. Leave `INSECURE_COOKIES=false`.
+
+### `TRUST_PROXY` cuts both ways — set it to match your actual deployment
+
+Rate limits on sign-up, PIN verification and admin login are keyed on the
+client IP, so this setting has to be right in both directions:
+
+- **`true` when nothing is in front of the app** lets a client set its own
+  `X-Forwarded-For` and rotate IPs at will, which defeats every rate limit.
+- **`false` when a proxy *is* in front** makes every request appear to come
+  from the proxy, so one abusive client rate-limits all of your subscribers.
+
+Set it to `true` only when exactly one trusted proxy (nginx, Caddy, Cloudflare)
+terminates the connection and overwrites `X-Forwarded-For`. If you add a second
+hop, `app.set('trust proxy', 1)` in `src/server/app.ts` needs the matching hop
+count.
 
 ### If you deploy somewhere with no direct DNS
 
@@ -393,6 +407,13 @@ longer carries anyone's email.
 - **Admin**: single bound email, unguessable mount path, lockout for 15 minutes
   after 5 failures, 8-hour server-side sessions whose tokens are stored only as
   hashes, all invalidated on a password change.
+- **Links in emails**: a manage link expires 30 days after it is issued, and a
+  fresh one goes out with every digest. It is bearer access — it shows the
+  subscriber's address and lets the holder change their sources — and it
+  travels through email, so it reaches mail logs, forwarded messages and
+  browser history. Unsubscribe links deliberately never expire: stopping
+  unwanted mail must work from any message, however old, and that token grants
+  nothing else.
 - **Web**: CSRF via double-submit cookie plus an Origin check; `HttpOnly`,
   `SameSite=Lax`, `Secure` cookies; CSP of `default-src 'none'` with no
   JavaScript anywhere in the app; HSTS in production; per-IP rate limits on
@@ -404,6 +425,25 @@ longer carries anyone's email.
 Rate limiting is in-process, which is correct for a single-process deployment.
 Behind more than one instance it would need a shared store.
 
+### Known limitations
+
+Stated rather than glossed over:
+
+- **DNS rebinding.** The SSRF guard resolves a hostname and checks the
+  addresses, but the subsequent connection is not pinned to a validated
+  address, so a name that resolves differently between the check and the
+  request could still be reached.
+- **PIN attempt counting is not transactional.** The attempt count is read and
+  then incremented in two statements, so a burst of concurrent requests can
+  land a few guesses beyond the five-attempt limit. The excess is bounded by
+  request concurrency and sits behind a per-IP limit, which leaves brute-force
+  of a six-digit PIN far out of reach — but it is not exactly five.
+- **Provider error messages are logged verbatim** when a verification email
+  fails to send, and an SMTP rejection often echoes the recipient address. The
+  address stays out of the database in plaintext, but it can appear in logs.
+- **Encryption at rest protects the database, not the process.** Covered above.
+- **Key rotation is unimplemented.** Covered above.
+
 ---
 
 ## Tests
@@ -412,7 +452,7 @@ Behind more than one instance it would need a shared store.
 npm test
 ```
 
-182 tests across URL and SSRF validation, cross-source clustering and scoring,
+187 tests across URL and SSRF validation, cross-source clustering and scoring,
 feed and HTML extraction, crypto and signed tokens, the subject-line format and
 HTML escaping, prompt-injection fencing, the subscriber and PIN lifecycle,
 admin authentication, timezone and send-hour handling (daylight saving,
