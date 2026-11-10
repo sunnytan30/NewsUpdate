@@ -366,9 +366,15 @@ longer carries anyone's email.
 - The admin console decrypts addresses to display them, which is the point of
   having one. A row that will not decrypt is shown as `(undecryptable)` rather
   than breaking the page.
-- Subscriber **names are not encrypted** — only the addresses were asked for. If
-  you want names covered too, the helper is field-agnostic: add a context label
-  to `FIELD`, encrypt on write and decrypt in `hydrate`.
+- Subscriber **names are deliberately left in plaintext**. A name is not a
+  unique identifier and is not a contact channel, so on its own it does not
+  let anyone reach or resolve a subscriber; the address, which is both, is what
+  the encryption protects. Encrypting names as well would cost admin
+  readability for little gain. Worth knowing where the line sits, though: a
+  name next to a source list still narrows identity, so a breached database is
+  not anonymous — it is just missing the identifier and the means of contact.
+  If that trade ever needs revisiting, the helper is field-agnostic: add a
+  context label to `FIELD`, encrypt on write and decrypt in `hydrate`.
 
 ## Security
 
