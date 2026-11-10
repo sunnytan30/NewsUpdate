@@ -1,0 +1,16 @@
+services:
+  newsupdate:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env
+    environment:
+      # Overrides the .env value so the database lands on the volume.
+      DATABASE_PATH: /data/newsupdate.sqlite
+    volumes:
+      - newsupdate-data:/data
+
+volumes:
+  newsupdate-data:

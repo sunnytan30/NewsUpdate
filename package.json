@@ -1,0 +1,42 @@
+{
+  "name": "newsupdate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daily cross-source news digest: subscribers register their own HTTPS news sources, stories corroborated across sources are ranked, summarised and emailed each morning.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && mkdir -p dist/db && cp src/db/schema.sql dist/db/schema.sql",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "digest:run": "tsx src/cli/run-digest.ts",
+    "admin:password": "tsx src/cli/set-admin-password.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.7.0",
+    "better-sqlite3": "^11.10.0",
+    "cheerio": "^1.0.0",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.13.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^6.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.9"
+  }
+}
