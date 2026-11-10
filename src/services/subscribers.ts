@@ -2,6 +2,7 @@ import { db, getSettingInt, SETTING_KEYS } from '../db/index.js';
 import { hashSecret, randomPin, verifySecret, signedToken, verifySignedToken } from '../util/crypto.js';
 import { config } from '../config.js';
 import { isValidTimeZone, localParts } from '../util/timezone.js';
+import { blindIndex, decryptField, encryptField, FIELD } from '../util/encryption.js';
 
 export const PIN_TTL_MINUTES = 15;
 export const PIN_MAX_ATTEMPTS = 5;
@@ -10,15 +11,36 @@ const PIN_MAX_ISSUES_PER_WINDOW = 3;
 
 export type SubscriberStatus = 'pending' | 'active' | 'unsubscribed';
 
-export type Subscriber = {
+/** A subscriber row as stored: the address is ciphertext plus a lookup index. */
+type SubscriberRow = {
   id: number;
-  email: string;
-  email_normalised: string;
+  email_enc: string;
+  email_index: string;
   name: string;
   status: SubscriberStatus;
   source_limit: number | null;
-  /** IANA timezone; the digest is sent at the configured local hour here. */
   timezone: string;
+  send_hour: number | null;
+  created_at: string;
+  verified_at: string | null;
+  unsubscribed_at: string | null;
+  last_digest_sent_at: string | null;
+  last_digest_local_date: string | null;
+};
+
+export type Subscriber = {
+  id: number;
+  /** Decrypted for use in this process. Never written back in plaintext. */
+  email: string;
+  /** Keyed index of the normalised address; safe to log and to put in links. */
+  email_index: string;
+  name: string;
+  status: SubscriberStatus;
+  source_limit: number | null;
+  /** IANA timezone; the digest is sent at this subscriber's hour in this zone. */
+  timezone: string;
+  /** Chosen local hour (0-23), or null to follow the global default. */
+  send_hour: number | null;
   created_at: string;
   verified_at: string | null;
   unsubscribed_at: string | null;
@@ -31,31 +53,55 @@ export function normaliseEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+/** The deterministic lookup value for an address. */
+export function emailIndex(email: string): string {
+  return blindIndex(normaliseEmail(email), FIELD.subscriberEmail);
+}
+
+/**
+ * Turn a stored row into a Subscriber, decrypting the address.
+ *
+ * A row whose ciphertext will not decrypt is a real fault — a wrong or rotated
+ * key — so it throws rather than quietly yielding a subscriber with no address
+ * that the digest would then try to email.
+ */
+function hydrate(row: SubscriberRow): Subscriber {
+  const { email_enc, ...rest } = row;
+  return { ...rest, email: decryptField(email_enc, FIELD.subscriberEmail) };
+}
+
 /** Trim and collapse a display name; it ends up in the email subject line. */
 export function cleanName(name: string): string {
   return name.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 export function findByEmail(email: string): Subscriber | null {
+  // Looked up by blind index: the plaintext address is never in a WHERE clause.
   const row = db
-    .prepare('SELECT * FROM subscribers WHERE email_normalised = ?')
-    .get(normaliseEmail(email)) as Subscriber | undefined;
-  return row ?? null;
+    .prepare('SELECT * FROM subscribers WHERE email_index = ?')
+    .get(emailIndex(email)) as SubscriberRow | undefined;
+  return row ? hydrate(row) : null;
 }
 
 export function findById(id: number): Subscriber | null {
-  const row = db.prepare('SELECT * FROM subscribers WHERE id = ?').get(id) as Subscriber | undefined;
-  return row ?? null;
+  const row = db.prepare('SELECT * FROM subscribers WHERE id = ?').get(id) as
+    | SubscriberRow
+    | undefined;
+  return row ? hydrate(row) : null;
 }
 
 export function listSubscribers(): Subscriber[] {
-  return db.prepare('SELECT * FROM subscribers ORDER BY created_at DESC').all() as Subscriber[];
+  const rows = db
+    .prepare('SELECT * FROM subscribers ORDER BY created_at DESC')
+    .all() as SubscriberRow[];
+  return rows.map(hydrate);
 }
 
 export function activeSubscribers(): Subscriber[] {
-  return db
+  const rows = db
     .prepare("SELECT * FROM subscribers WHERE status = 'active' ORDER BY id")
-    .all() as Subscriber[];
+    .all() as SubscriberRow[];
+  return rows.map(hydrate);
 }
 
 /** The effective source limit: the per-subscriber override, else the global default. */
@@ -77,10 +123,42 @@ export function effectiveSourceLimit(subscriber: Subscriber): number {
  */
 export const SEND_CATCHUP_HOURS = 4;
 
-/** The configured send hour, clamped to a valid hour of the day. */
-export function sendHour(): number {
+/** Lowest and highest hour a subscriber may choose. */
+export const MIN_SEND_HOUR = 0;
+export const MAX_SEND_HOUR = 23;
+
+export function isValidSendHour(hour: unknown): hour is number {
+  return (
+    typeof hour === 'number' &&
+    Number.isInteger(hour) &&
+    hour >= MIN_SEND_HOUR &&
+    hour <= MAX_SEND_HOUR
+  );
+}
+
+/**
+ * The global default send hour, used by subscribers who have not chosen one.
+ * Clamped, so a bad stored setting cannot push anyone outside a real hour.
+ */
+export function defaultSendHour(): number {
   const hour = getSettingInt(SETTING_KEYS.sendHour, config.DEFAULT_SEND_HOUR);
-  return Math.min(23, Math.max(0, hour));
+  return Math.min(MAX_SEND_HOUR, Math.max(MIN_SEND_HOUR, hour));
+}
+
+/**
+ * The hour this subscriber actually receives their digest: their own choice if
+ * they made one, otherwise the global default. Same override pattern as
+ * `source_limit`, so changing the default moves everyone who never chose.
+ */
+export function effectiveSendHour(subscriber: Subscriber): number {
+  return isValidSendHour(subscriber.send_hour) ? subscriber.send_hour : defaultSendHour();
+}
+
+/** Set or clear a subscriber's chosen hour. Pass null to follow the default. */
+export function setSendHour(subscriberId: number, hour: number | null): boolean {
+  if (hour !== null && !isValidSendHour(hour)) return false;
+  db.prepare('UPDATE subscribers SET send_hour = ? WHERE id = ?').run(hour, subscriberId);
+  return true;
 }
 
 /** Resolve a user-supplied timezone, falling back to the configured default. */
@@ -100,17 +178,19 @@ export type DueCheck = { due: true } | { due: false; reason: string };
 /**
  * Whether this subscriber should receive a digest now.
  *
- * Due when their local clock has reached the send hour, is still inside the
+ * Due when their local clock has reached *their* send hour, is still inside the
  * catch-up window, and they have not already been sent a digest on their own
- * local calendar date. Evaluating the date in the subscriber's zone is what
- * makes "once a day" mean once a day *for them*.
+ * local calendar date. Evaluating both the hour and the date in the
+ * subscriber's own terms is what makes "once a day" mean once a day *for them*.
+ *
+ * `hour` overrides the subscriber's own choice, and exists for tests.
  */
 export function isDue(
   subscriber: Subscriber,
   options: { now?: Date; hour?: number; catchupHours?: number } = {},
 ): DueCheck {
   const now = options.now ?? new Date();
-  const target = options.hour ?? sendHour();
+  const target = options.hour ?? effectiveSendHour(subscriber);
   const catchup = options.catchupHours ?? SEND_CATCHUP_HOURS;
 
   const local = localParts(now, resolveTimezone(subscriber.timezone));
@@ -119,7 +199,10 @@ export function isDue(
     return { due: false, reason: 'already sent today in their timezone' };
   }
   if (local.hour < target) {
-    return { due: false, reason: `local time ${local.hour}:00 is before the send hour` };
+    return {
+      due: false,
+      reason: `local time ${local.hour}:00 is before their send hour of ${target}:00`,
+    };
   }
   // Cap at midnight so a late send hour does not spill into the next day.
   if (local.hour >= Math.min(target + catchup, 24)) {
@@ -128,10 +211,12 @@ export function isDue(
   return { due: true };
 }
 
-/** Active subscribers whose local clock says it is time to send. */
+/**
+ * Active subscribers whose local clock says it is time to send. Each is judged
+ * against their own hour, so one sweep can serve several send hours at once.
+ */
 export function dueSubscribers(now = new Date()): Subscriber[] {
-  const hour = sendHour();
-  return activeSubscribers().filter((s) => isDue(s, { now, hour }).due);
+  return activeSubscribers().filter((s) => isDue(s, { now }).due);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,19 +348,33 @@ export type SignupOutcome =
  * message regardless of the outcome, so the form cannot be used to discover
  * whether an address is already signed up.
  */
-export function startSignup(name: string, email: string, timezone?: string): SignupOutcome {
+export function startSignup(
+  name: string,
+  email: string,
+  timezone?: string,
+  hour?: number | null,
+): SignupOutcome {
   const normalised = normaliseEmail(email);
   const display = cleanName(name);
   const zone = resolveTimezone(timezone);
+  // An hour outside 0-23, or none at all, means "follow the global default".
+  const chosenHour = isValidSendHour(hour) ? hour : null;
   const existing = findByEmail(normalised);
 
   if (!existing) {
     const info = db
       .prepare(
-        `INSERT INTO subscribers (email, email_normalised, name, status, timezone)
-         VALUES (?, ?, ?, 'pending', ?)`,
+        `INSERT INTO subscribers (email_enc, email_index, name, status, timezone, send_hour)
+         VALUES (?, ?, ?, 'pending', ?, ?)`,
       )
-      .run(email.trim(), normalised, display, zone);
+      .run(
+        // Stored encrypted; the normalised form only ever becomes an index.
+        encryptField(email.trim(), FIELD.subscriberEmail),
+        blindIndex(normalised, FIELD.subscriberEmail),
+        display,
+        zone,
+        chosenHour,
+      );
     const created = findById(Number(info.lastInsertRowid));
     if (!created) return { kind: 'throttled' };
     const pin = issuePin(created.id, 'verify');
@@ -288,6 +387,11 @@ export function startSignup(name: string, email: string, timezone?: string): Sig
   db.prepare('UPDATE subscribers SET name = ? WHERE id = ?').run(display, existing.id);
   if (timezone && isValidTimeZone(timezone.trim())) {
     db.prepare('UPDATE subscribers SET timezone = ? WHERE id = ?').run(timezone.trim(), existing.id);
+  }
+  // Likewise the hour: only overwritten when a usable one was submitted, so a
+  // returning subscriber keeps the hour they previously chose.
+  if (isValidSendHour(hour)) {
+    db.prepare('UPDATE subscribers SET send_hour = ? WHERE id = ?').run(hour, existing.id);
   }
 
   // An already-verified subscriber gets a manage code rather than being
@@ -362,12 +466,22 @@ export function markDigestSent(subscriber: Subscriber, now = new Date()): void {
 // Signed links for email footers
 // ---------------------------------------------------------------------------
 
+/**
+ * Links are bound to a short prefix of the blind index rather than to the
+ * address itself. The token appears in a URL, in mail logs and in browser
+ * history, so it must not carry the subscriber's email; 128 bits of the keyed
+ * index is ample to detect the address changing.
+ */
+function linkBinding(subscriber: Subscriber): string {
+  return subscriber.email_index.slice(0, 32);
+}
+
 export function manageToken(subscriber: Subscriber): string {
-  return signedToken(`manage:${subscriber.id}:${subscriber.email_normalised}`);
+  return signedToken(`manage:${subscriber.id}:${linkBinding(subscriber)}`);
 }
 
 export function unsubscribeToken(subscriber: Subscriber): string {
-  return signedToken(`unsub:${subscriber.id}:${subscriber.email_normalised}`);
+  return signedToken(`unsub:${subscriber.id}:${linkBinding(subscriber)}`);
 }
 
 /** Resolve a signed link token back to a subscriber, verifying the purpose. */
@@ -377,14 +491,14 @@ export function subscriberFromToken(
 ): Subscriber | null {
   const payload = verifySignedToken(token);
   if (!payload) return null;
-  const [purpose, idPart, emailPart] = payload.split(':');
+  const [purpose, idPart, bindingPart] = payload.split(':');
   if (purpose !== expected) return null;
   const id = Number(idPart);
   if (!Number.isInteger(id)) return null;
   const subscriber = findById(id);
   if (!subscriber) return null;
-  // Binding the email means the link stops working if the address changes.
-  if (subscriber.email_normalised !== emailPart) return null;
+  // Binding to the index means the link stops working if the address changes.
+  if (linkBinding(subscriber) !== bindingPart) return null;
   return subscriber;
 }
 

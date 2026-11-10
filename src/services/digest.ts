@@ -1,6 +1,7 @@
 import { db, getSettingInt, SETTING_KEYS } from '../db/index.js';
 import { config } from '../config.js';
 import { log } from '../util/logger.js';
+import { decryptField, FIELD } from '../util/encryption.js';
 import { collectFromSource, fetchArticleBody, type RawArticle } from './extract.js';
 import { mapLimit } from './fetcher.js';
 import { clusterStories, type ArticleWithSource, type ClusteredStory } from './cluster.js';
@@ -14,7 +15,7 @@ import {
   markDigestConsidered,
   markDigestSent,
   resolveTimezone,
-  sendHour,
+  defaultSendHour,
   unsubscribeUrl,
   type Subscriber,
 } from './subscribers.js';
@@ -320,7 +321,7 @@ export async function runDigest(options: RunOptions = {}): Promise<RunSummary> {
   };
 
   if (recipients.length === 0) {
-    log.debug('sweep found nobody due', { sendHour: sendHour() });
+    log.debug('sweep found nobody due', { sendHour: defaultSendHour() });
     return {
       runId: 0,
       ...stats,
@@ -462,11 +463,24 @@ export type DeliveryRow = {
 };
 
 export function recentDeliveries(limit = 50): DeliveryRow[] {
-  return db
+  const rows = db
     .prepare(
-      `SELECT d.*, s.email
+      `SELECT d.*, s.email_enc
        FROM deliveries d LEFT JOIN subscribers s ON s.id = d.subscriber_id
        ORDER BY d.id DESC LIMIT ?`,
     )
-    .all(limit) as DeliveryRow[];
+    .all(limit) as (Omit<DeliveryRow, 'email'> & { email_enc: string | null })[];
+
+  return rows.map(({ email_enc, ...rest }) => {
+    let email: string | null = null;
+    if (email_enc) {
+      try {
+        email = decryptField(email_enc, FIELD.subscriberEmail);
+      } catch {
+        // A row we cannot decrypt must not break the whole admin page.
+        email = '(undecryptable)';
+      }
+    }
+    return { ...rest, email };
+  });
 }

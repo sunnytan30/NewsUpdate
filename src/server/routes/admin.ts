@@ -7,9 +7,10 @@ import { adminExists, login, logout, sessionIsValid } from '../../services/admin
 import { adminDashboard, adminLoginPage, noticePage, type Flash } from '../views.js';
 import { cookieOptions, rateLimit, resetRateLimit } from '../middleware.js';
 import {
+  defaultSendHour,
+  effectiveSendHour,
   effectiveSourceLimit,
   listSubscribers,
-  sendHour,
   setSourceLimit,
   setStatus,
   type Subscriber,
@@ -44,7 +45,11 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   );
 }
 
-type SubscriberWithCounts = Subscriber & { source_count: number; effective_limit: number };
+type SubscriberWithCounts = Subscriber & {
+  source_count: number;
+  effective_limit: number;
+  effective_hour: number;
+};
 
 function subscribersWithCounts(): SubscriberWithCounts[] {
   const counts = db
@@ -56,6 +61,7 @@ function subscribersWithCounts(): SubscriberWithCounts[] {
     ...subscriber,
     source_count: byId.get(subscriber.id) ?? 0,
     effective_limit: effectiveSourceLimit(subscriber),
+    effective_hour: effectiveSendHour(subscriber),
   }));
 }
 
@@ -72,7 +78,7 @@ function renderDashboard(res: Response, flash: Flash): void {
         maxStories: getSettingInt(SETTING_KEYS.maxStoriesPerEmail, config.MAX_STORIES_PER_EMAIL),
         signupsOpen: getSettingBool(SETTING_KEYS.signupsOpen, true),
         minSourcesForTrending: getSettingInt(SETTING_KEYS.minSourcesForTrending, 2),
-        sendHour: sendHour(),
+        sendHour: defaultSendHour(),
       },
       subscribers: subscribersWithCounts(),
       runs: recentRuns(15),

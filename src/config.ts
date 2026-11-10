@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import { isValidTimeZone } from './util/timezone.js';
+import { initFieldEncryption } from './util/encryption.js';
 
 const bool = (def: boolean) =>
   z
@@ -27,6 +28,9 @@ const Schema = z.object({
 
   SESSION_SECRET: z.string().min(1).optional(),
   TOKEN_SECRET: z.string().min(1).optional(),
+  // Encrypts subscriber email addresses at rest. 32 bytes, hex or base64.
+  // Losing it makes every stored address unreadable and unrecoverable.
+  ENCRYPTION_KEY: z.string().min(1).optional(),
 
   ADMIN_PATH: z.string().default('/console-dev-only-change-me'),
   // Deliberately has no default: the admin identity is deployment
@@ -129,6 +133,40 @@ if (raw.DIGEST_CRON) {
 
 if (raw.DEFAULT_SEND_HOUR < 0 || raw.DEFAULT_SEND_HOUR > 23) {
   console.error('DEFAULT_SEND_HOUR must be between 0 and 23.');
+  process.exit(1);
+}
+
+/**
+ * Key for encrypting stored email addresses.
+ *
+ * Required in production. In development a fixed, well-known key is used so a
+ * local database stays readable across restarts — it is not a secret, and the
+ * warning says so.
+ */
+const DEV_ENCRYPTION_KEY = '00'.repeat(32);
+
+const encryptionKey = (() => {
+  const supplied = raw.ENCRYPTION_KEY?.trim();
+  if (supplied) return supplied;
+  if (isProd) {
+    console.error(
+      'ENCRYPTION_KEY must be set in production; subscriber email addresses are encrypted with it.\n' +
+        'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"\n' +
+        'Back it up before going live: without it, stored addresses cannot be recovered.',
+    );
+    process.exit(1);
+  }
+  console.warn(
+    '[config] ENCRYPTION_KEY is unset; using a fixed development key. ' +
+      'Stored addresses are NOT protected. Never run this way in production.',
+  );
+  return DEV_ENCRYPTION_KEY;
+})();
+
+try {
+  initFieldEncryption(encryptionKey);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
 

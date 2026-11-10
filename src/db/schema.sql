@@ -7,13 +7,19 @@ PRAGMA foreign_keys = ON;
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS subscribers (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-  email               TEXT    NOT NULL,
-  email_normalised    TEXT    NOT NULL UNIQUE,
+  -- The address, AES-256-GCM encrypted. Never stored in plaintext.
+  email_enc           TEXT    NOT NULL,
+  -- Keyed HMAC of the normalised address. Deterministic, so it can be looked
+  -- up and made UNIQUE, but reveals nothing without the key.
+  email_index         TEXT    NOT NULL UNIQUE,
   name                TEXT    NOT NULL,
   status              TEXT    NOT NULL DEFAULT 'pending'
                               CHECK (status IN ('pending', 'active', 'unsubscribed')),
   -- NULL means "use the global default from settings".
   source_limit        INTEGER,
+  -- Local hour (0-23) this subscriber wants their digest. NULL means "use the
+  -- global default from settings".
+  send_hour           INTEGER CHECK (send_hour IS NULL OR (send_hour BETWEEN 0 AND 23)),
   -- IANA timezone name. The digest is sent at the configured local hour in
   -- this zone, so a subscriber abroad is not woken in the middle of the night.
   timezone            TEXT    NOT NULL DEFAULT 'Asia/Singapore',

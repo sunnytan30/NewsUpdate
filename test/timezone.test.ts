@@ -8,10 +8,12 @@ import {
 } from '../src/util/timezone.js';
 import {
   checkPin,
+  defaultSendHour,
+  effectiveSendHour,
   findByEmail,
   isDue,
   resolveTimezone,
-  sendHour,
+  setSendHour,
   setTimezone,
   startSignup,
   type Subscriber,
@@ -176,7 +178,7 @@ describe('isDue', () => {
   const base: Subscriber = {
     id: 1,
     email: 'person@example.test',
-    email_normalised: 'person@example.test',
+    email_index: 'a'.repeat(64),
     name: 'Sunny',
     status: 'active',
     source_limit: null,
@@ -195,7 +197,7 @@ describe('isDue', () => {
   it('is not due before the send hour', () => {
     const check = isDue(base, { now: new Date('2026-11-10T22:00:00Z') });
     expect(check.due).toBe(false);
-    if (!check.due) expect(check.reason).toMatch(/before the send hour/);
+    if (!check.due) expect(check.reason).toMatch(/before their send hour/);
   });
 
   it('is not due once the catch-up window has passed', () => {
@@ -247,7 +249,7 @@ describe('isDue', () => {
 
   it('respects a changed send hour', () => {
     setSetting(SETTING_KEYS.sendHour, '18');
-    expect(sendHour()).toBe(18);
+    expect(defaultSendHour()).toBe(18);
     // 18:00 Singapore is 10:00Z.
     expect(isDue(base, { now: new Date('2026-11-11T10:00:00Z') }).due).toBe(true);
     expect(isDue(base, { now: new Date('2026-11-10T23:00:00Z') }).due).toBe(false);
@@ -259,6 +261,141 @@ describe('isDue', () => {
     // is within four hours of the send hour.
     expect(isDue(base, { now: new Date('2026-11-11T15:00:00Z') }).due).toBe(true);
     expect(isDue(base, { now: new Date('2026-11-11T18:00:00Z') }).due).toBe(false);
+  });
+});
+
+describe('per-subscriber send hour', () => {
+  function subscriber(email = 'person@example.test'): Subscriber {
+    const outcome = startSignup('Sunny', email);
+    if (outcome.kind !== 'pin-sent') throw new Error('expected a PIN');
+    const verified = checkPin(email, outcome.pin, 'verify');
+    if (!verified.ok) throw new Error('expected verification to succeed');
+    return verified.subscriber;
+  }
+
+  it('follows the global default until a choice is made', () => {
+    const s = subscriber();
+    expect(s.send_hour).toBeNull();
+    expect(effectiveSendHour(s)).toBe(7);
+
+    setSetting(SETTING_KEYS.sendHour, '6');
+    expect(effectiveSendHour(s)).toBe(6);
+  });
+
+  it('prefers the subscriber\'s own hour over the default', () => {
+    const s = subscriber();
+    expect(setSendHour(s.id, 21)).toBe(true);
+    const updated = findByEmail('person@example.test') as Subscriber;
+    expect(updated.send_hour).toBe(21);
+    expect(effectiveSendHour(updated)).toBe(21);
+
+    // Changing the default no longer moves them.
+    setSetting(SETTING_KEYS.sendHour, '6');
+    expect(effectiveSendHour(updated)).toBe(21);
+  });
+
+  it('clears the override back to the default', () => {
+    const s = subscriber();
+    setSendHour(s.id, 21);
+    expect(setSendHour(s.id, null)).toBe(true);
+    const updated = findByEmail('person@example.test') as Subscriber;
+    expect(updated.send_hour).toBeNull();
+    expect(effectiveSendHour(updated)).toBe(7);
+  });
+
+  it('accepts every hour of the day, including the boundaries', () => {
+    const s = subscriber();
+    for (const hour of [0, 1, 12, 22, 23]) {
+      expect(setSendHour(s.id, hour), String(hour)).toBe(true);
+      expect(effectiveSendHour(findByEmail('person@example.test') as Subscriber)).toBe(hour);
+    }
+  });
+
+  it('refuses an hour outside 0-23 and leaves the stored value alone', () => {
+    const s = subscriber();
+    setSendHour(s.id, 9);
+    for (const bad of [-1, 24, 25, 7.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(setSendHour(s.id, bad), String(bad)).toBe(false);
+    }
+    expect((findByEmail('person@example.test') as Subscriber).send_hour).toBe(9);
+  });
+
+  it('is recorded at sign-up when chosen', () => {
+    const outcome = startSignup('Sunny', 'person@example.test', 'Europe/London', 18);
+    if (outcome.kind !== 'pin-sent') throw new Error('expected a PIN');
+    expect(outcome.subscriber.send_hour).toBe(18);
+    expect(effectiveSendHour(outcome.subscriber)).toBe(18);
+  });
+
+  it('is left to the default when not chosen or out of range at sign-up', () => {
+    const a = startSignup('A', 'a@example.test', 'Europe/London');
+    if (a.kind !== 'pin-sent') throw new Error('expected a PIN');
+    expect(a.subscriber.send_hour).toBeNull();
+
+    const b = startSignup('B', 'b@example.test', 'Europe/London', 99);
+    if (b.kind !== 'pin-sent') throw new Error('expected a PIN');
+    expect(b.subscriber.send_hour).toBeNull();
+  });
+
+  it('does not wipe a chosen hour when a returning subscriber submits none', () => {
+    const first = startSignup('Sunny', 'person@example.test', 'Asia/Singapore', 20);
+    if (first.kind !== 'pin-sent') throw new Error('expected a PIN');
+    checkPin('person@example.test', first.pin, 'verify');
+
+    startSignup('Sunny', 'person@example.test');
+    expect((findByEmail('person@example.test') as Subscriber).send_hour).toBe(20);
+  });
+
+  it('decides due-ness by the subscriber\'s own hour', () => {
+    const s = subscriber();
+    setSendHour(s.id, 20);
+    const updated = findByEmail('person@example.test') as Subscriber;
+
+    // 07:00 Singapore, the global default, is no longer their hour.
+    expect(isDue(updated, { now: new Date('2026-11-10T23:00:00Z') }).due).toBe(false);
+    // 20:00 Singapore is 12:00Z.
+    expect(isDue(updated, { now: new Date('2026-11-11T12:00:00Z') }).due).toBe(true);
+  });
+
+  it('applies the catch-up window to the chosen hour, not the default', () => {
+    const s = subscriber();
+    setSendHour(s.id, 20);
+    const updated = findByEmail('person@example.test') as Subscriber;
+
+    // 23:59 Singapore is still inside four hours of 20:00.
+    expect(isDue(updated, { now: new Date('2026-11-11T15:59:00Z') }).due).toBe(true);
+    // 00:00 the next local day is not: the window never crosses midnight.
+    expect(isDue(updated, { now: new Date('2026-11-11T16:00:00Z') }).due).toBe(false);
+  });
+
+  it('lets two subscribers in one zone receive at different hours', () => {
+    const early = subscriber('early@example.test');
+    const late = subscriber('late@example.test');
+    setSendHour(early.id, 7);
+    setSendHour(late.id, 19);
+
+    const earlyRow = findByEmail('early@example.test') as Subscriber;
+    const lateRow = findByEmail('late@example.test') as Subscriber;
+
+    const morning = new Date('2026-11-10T23:00:00Z'); // 07:00 Singapore
+    expect(isDue(earlyRow, { now: morning }).due).toBe(true);
+    expect(isDue(lateRow, { now: morning }).due).toBe(false);
+
+    const evening = new Date('2026-11-11T11:00:00Z'); // 19:00 Singapore
+    expect(isDue(earlyRow, { now: evening }).due).toBe(false);
+    expect(isDue(lateRow, { now: evening }).due).toBe(true);
+  });
+
+  it('combines a chosen hour with a chosen timezone', () => {
+    const s = subscriber();
+    setSendHour(s.id, 6);
+    setTimezone(s.id, 'America/New_York');
+    const updated = findByEmail('person@example.test') as Subscriber;
+
+    // 06:00 New York in November (EST, UTC-5) is 11:00Z.
+    expect(isDue(updated, { now: new Date('2026-11-11T11:00:00Z') }).due).toBe(true);
+    // 06:00 Singapore would be 22:00Z the day before; not their hour.
+    expect(isDue(updated, { now: new Date('2026-11-10T22:00:00Z') }).due).toBe(false);
   });
 });
 

@@ -15,6 +15,8 @@ process.env.ADMIN_EMAIL = 'admin@example.test';
 process.env.ADMIN_PATH = '/console-test-abcdef123456';
 process.env.SESSION_SECRET = 'a'.repeat(64);
 process.env.TOKEN_SECRET = 'b'.repeat(64);
+// Fixed test key: subscriber email addresses are encrypted at rest.
+process.env.ENCRYPTION_KEY = 'c'.repeat(64);
 process.env.BASE_URL = 'https://news.example.test';
 process.env.MAIL_PROVIDER = 'console';
 process.env.SUMMARISER = 'extractive';

@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { log } from '../util/logger.js';
 import { runDigest } from '../services/digest.js';
 import { purgeExpiredSessions } from '../services/admin.js';
-import { sendHour } from '../services/subscribers.js';
+import { defaultSendHour } from '../services/subscribers.js';
 
 let running = false;
 
@@ -53,7 +53,7 @@ export function startScheduler(): void {
 
   log.info('scheduler started', {
     sweep: config.DIGEST_SWEEP_CRON,
-    sendHourLocal: sendHour(),
+    defaultSendHourLocal: defaultSendHour(),
     defaultTimezone: config.DEFAULT_TIMEZONE,
   });
 }

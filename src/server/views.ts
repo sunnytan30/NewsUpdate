@@ -123,6 +123,32 @@ function zoneOptionsHtml(): string {
   return html;
 }
 
+/**
+ * Hour-of-day picker, 00:00 to 23:00.
+ *
+ * `selected` is the hour to preselect; `defaultHour` is the global default,
+ * labelled as such on the "follow the default" option so the subscriber can
+ * see what they would get by not choosing. Passing `selected: null` selects
+ * that option.
+ */
+function hourSelect(opts: {
+  id: string;
+  name: string;
+  selected: number | null;
+  defaultHour: number;
+}): string {
+  const pad = (h: number) => String(h).padStart(2, '0');
+  const options = [
+    `<option value=""${opts.selected === null ? ' selected' : ''}>` +
+      `Use the default (${esc(pad(opts.defaultHour))}:00)</option>`,
+    ...Array.from({ length: 24 }, (_v, hour) => {
+      const chosen = opts.selected === hour ? ' selected' : '';
+      return `<option value="${hour}"${chosen}>${esc(pad(hour))}:00</option>`;
+    }),
+  ].join('');
+  return `<select id="${esc(opts.id)}" name="${esc(opts.name)}">${options}</select>`;
+}
+
 function timezoneSelect(opts: { id: string; name: string; selected: string }): string {
   // Mark the selected option without rebuilding the cached list.
   const needle = `<option value="${esc(opts.selected)}">`;
@@ -143,6 +169,8 @@ export function signupPage(opts: {
   name?: string;
   email?: string;
   timezone?: string;
+  /** Hour submitted on a failed attempt, so the form keeps their choice. */
+  chosenHour?: number | null;
   signupsOpen: boolean;
   sourceLimit: number;
   sendHour: number;
@@ -170,15 +198,28 @@ export function signupPage(opts: {
            value="${esc(opts.email ?? '')}">
     <p class="hint">We send a 6-digit code to confirm the address is yours.</p>
 
-    <label for="timezone">Your timezone</label>
-    ${timezoneSelect({
-      id: 'timezone',
-      name: 'timezone',
-      selected: opts.timezone ?? config.DEFAULT_TIMEZONE,
-    })}
+    <div class="row">
+      <div>
+        <label for="timezone">Your timezone</label>
+        ${timezoneSelect({
+          id: 'timezone',
+          name: 'timezone',
+          selected: opts.timezone ?? config.DEFAULT_TIMEZONE,
+        })}
+      </div>
+      <div>
+        <label for="send_hour">Delivery time</label>
+        ${hourSelect({
+          id: 'send_hour',
+          name: 'send_hour',
+          selected: opts.chosenHour ?? null,
+          defaultHour: opts.sendHour,
+        })}
+      </div>
+    </div>
     <p class="hint">
-      Your digest arrives at ${esc(hour)}:00 in this timezone, so it reaches you in the morning
-      wherever you are. You can change it later.
+      Your digest arrives at the hour you pick, in your own timezone. Leave it on the default
+      and you will get it at ${esc(hour)}:00 local time. Both can be changed later.
     </p>
 
     <button type="submit">Send me a code</button>
@@ -191,7 +232,7 @@ export function signupPage(opts: {
   <p class="hint">
     1. Confirm your email with the code we send.<br>
     2. Add up to ${esc(opts.sourceLimit)} news sites (https only).<br>
-    3. Receive your digest at ${esc(hour)}:00 your local time. Unsubscribe from any email.
+    3. Receive your digest at your chosen hour, your local time. Unsubscribe from any email.
   </p>
 </div>
 <footer>Already signed up? Use the manage link in any digest email.</footer>`;
@@ -262,10 +303,13 @@ export function managePage(opts: {
   subscriber: Subscriber;
   sources: Source[];
   limit: number;
-  sendHour: number;
+  /** The global default hour, shown on the "use the default" option. */
+  defaultHour: number;
+  /** The hour this subscriber actually receives their digest. */
+  effectiveHour: number;
 }): string {
   const atLimit = opts.sources.length >= opts.limit;
-  const hour = String(opts.sendHour).padStart(2, '0');
+  const hour = String(opts.effectiveHour).padStart(2, '0');
   const offset = offsetLabel(opts.subscriber.timezone);
   const body = `
 <div class="card">
@@ -318,15 +362,32 @@ export function managePage(opts: {
 <div class="card">
   <h2>Delivery time</h2>
   <p class="hint">
-    Your digest is sent at <strong>${esc(hour)}:00</strong> in your timezone, currently
+    Your digest is sent at <strong>${esc(hour)}:00</strong> in
     <strong>${esc(opts.subscriber.timezone.replace(/_/g, ' '))}</strong>${offset ? ` (${esc(offset)})` : ''}.
-    Change it if you move or if you are travelling for a while.
+    Change either if you move, or if a different hour suits you better.
   </p>
-  <form method="post" action="/manage/${esc(opts.token)}/timezone">
+  <form method="post" action="/manage/${esc(opts.token)}/schedule">
     ${csrfField(opts.csrf)}
-    <label for="timezone">Timezone</label>
-    ${timezoneSelect({ id: 'timezone', name: 'timezone', selected: opts.subscriber.timezone })}
-    <button type="submit">Save timezone</button>
+    <div class="row">
+      <div>
+        <label for="timezone">Timezone</label>
+        ${timezoneSelect({ id: 'timezone', name: 'timezone', selected: opts.subscriber.timezone })}
+      </div>
+      <div>
+        <label for="send_hour">Hour</label>
+        ${hourSelect({
+          id: 'send_hour',
+          name: 'send_hour',
+          selected: opts.subscriber.send_hour,
+          defaultHour: opts.defaultHour,
+        })}
+      </div>
+    </div>
+    <p class="hint">
+      A change takes effect from your next digest. If today's has already been sent, the new time
+      applies from tomorrow.
+    </p>
+    <button type="submit">Save delivery time</button>
   </form>
 </div>
 
@@ -393,7 +454,7 @@ export function adminLoginPage(opts: { csrf: string; flash: Flash; adminPath: st
 }
 
 function subscriberRow(
-  row: Subscriber & { source_count: number; effective_limit: number },
+  row: Subscriber & { source_count: number; effective_limit: number; effective_hour: number },
   csrf: string,
   adminPath: string,
 ): string {
@@ -414,6 +475,9 @@ function subscriberRow(
     <div class="hint">Blank uses the default (${esc(row.effective_limit)}).</div>
   </td>
   <td>
+    <div class="hint">${esc(String(row.effective_hour).padStart(2, '0'))}:00${
+      row.send_hour === null ? ' (default)' : ''
+    }</div>
     <div class="hint">${esc(row.timezone.replace(/_/g, ' '))}</div>
   </td>
   <td>
@@ -443,7 +507,7 @@ export function adminDashboard(opts: {
     minSourcesForTrending: number;
     sendHour: number;
   };
-  subscribers: (Subscriber & { source_count: number; effective_limit: number })[];
+  subscribers: (Subscriber & { source_count: number; effective_limit: number; effective_hour: number })[];
   runs: RunRow[];
   deliveries: DeliveryRow[];
   summariser: string;
@@ -484,7 +548,7 @@ export function adminDashboard(opts: {
                value="${esc(opts.settings.minSourcesForTrending)}" required>
       </div>
       <div>
-        <label for="send_hour">Send hour (each subscriber's local time)</label>
+        <label for="send_hour">Default send hour (local time)</label>
         <input id="send_hour" name="send_hour" type="number" min="0" max="23"
                value="${esc(opts.settings.sendHour)}" required>
       </div>
@@ -502,8 +566,10 @@ export function adminDashboard(opts: {
     </p>
     <p class="hint">
       The send hour is applied in each subscriber's own timezone, so nobody is emailed overnight.
-      A digest missed because the service was down is still sent if the subscriber's local time is
-      within four hours of the send hour; after that it waits for the next day.
+      It is only the default: a subscriber who picked their own hour keeps it, and changing this
+      moves everyone who did not. A digest missed because the service was down is still sent if
+      the subscriber's local time is within four hours of their hour; after that it waits for the
+      next day.
     </p>
     <button type="submit">Save settings</button>
   </form>
@@ -515,7 +581,7 @@ export function adminDashboard(opts: {
     opts.subscribers.length === 0
       ? '<p class="hint">No subscribers yet.</p>'
       : `<table>
-    <thead><tr><th>Person</th><th>Status</th><th>Sources</th><th>Source limit</th><th>Timezone</th><th>Last digest</th><th></th></tr></thead>
+    <thead><tr><th>Person</th><th>Status</th><th>Sources</th><th>Source limit</th><th>Delivery</th><th>Last digest</th><th></th></tr></thead>
     <tbody>${opts.subscribers.map((s) => subscriberRow(s, opts.csrf, opts.adminPath)).join('')}</tbody>
   </table>`
   }

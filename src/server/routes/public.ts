@@ -19,7 +19,10 @@ import {
   manageToken,
   normaliseEmail,
   PIN_TTL_MINUTES,
-  sendHour,
+  defaultSendHour,
+  effectiveSendHour,
+  isValidSendHour,
+  setSendHour,
   setStatus,
   setTimezone,
   startSignup,
@@ -37,11 +40,24 @@ const SignupSchema = z.object({
   // Validated against the IANA list in resolveTimezone; an unrecognised value
   // falls back to the configured default rather than failing the sign-up.
   timezone: z.string().max(64).optional(),
+  // Empty string means "follow the global default".
+  send_hour: z.string().max(2).optional(),
 });
 
-const TimezoneSchema = z.object({
+const ScheduleSchema = z.object({
   timezone: z.string().min(1).max(64),
+  send_hour: z.string().max(2).optional(),
 });
+
+/**
+ * Read an hour from a form field. An empty field means "follow the global
+ * default", which is distinct from an invalid one.
+ */
+function parseHourField(raw: string | undefined): { ok: true; hour: number | null } | { ok: false } {
+  if (raw === undefined || raw.trim() === '') return { ok: true, hour: null };
+  const hour = Number.parseInt(raw.trim(), 10);
+  return isValidSendHour(hour) ? { ok: true, hour } : { ok: false };
+}
 
 const VerifySchema = z.object({
   email: z.string().email().max(254),
@@ -69,7 +85,7 @@ publicRouter.get('/', (_req, res) => {
       flash: null,
       signupsOpen: getSettingBool(SETTING_KEYS.signupsOpen, true),
       sourceLimit: defaultLimit(),
-      sendHour: sendHour(),
+      sendHour: defaultSendHour(),
     }),
   );
 });
@@ -80,6 +96,9 @@ publicRouter.post(
   async (req, res) => {
     const signupsOpen = getSettingBool(SETTING_KEYS.signupsOpen, true);
     const submittedZone = typeof req.body?.timezone === 'string' ? req.body.timezone : undefined;
+    const submittedHour = parseHourField(
+      typeof req.body?.send_hour === 'string' ? req.body.send_hour : undefined,
+    );
     const render = (flash: Flash, name?: string, email?: string) =>
       res.type('html').send(
         signupPage({
@@ -88,9 +107,10 @@ publicRouter.post(
           name,
           email,
           timezone: submittedZone,
+          chosenHour: submittedHour.ok ? submittedHour.hour : null,
           signupsOpen,
           sourceLimit: defaultLimit(),
-          sendHour: sendHour(),
+          sendHour: defaultSendHour(),
         }),
       );
 
@@ -116,7 +136,13 @@ publicRouter.post(
     }
 
     const email = normaliseEmail(parsed.data.email);
-    const outcome = startSignup(name, email, parsed.data.timezone);
+    const hour = parseHourField(parsed.data.send_hour);
+    if (!hour.ok) {
+      render({ kind: 'err', text: 'Choose a delivery hour from the list.' }, name, parsed.data.email);
+      return;
+    }
+
+    const outcome = startSignup(name, email, parsed.data.timezone, hour.hour);
 
     if (outcome.kind === 'pin-sent') {
       const mail = verificationEmail({
@@ -217,7 +243,8 @@ function renderManage(res: Response, token: string, flash: Flash): void {
       subscriber,
       sources: listSources(subscriber.id),
       limit: effectiveSourceLimit(subscriber),
-      sendHour: sendHour(),
+      defaultHour: defaultSendHour(),
+      effectiveHour: effectiveSendHour(subscriber),
     }),
   );
 }
@@ -276,7 +303,8 @@ publicRouter.post('/manage/:token/sources/:id/delete', (req, res) => {
   );
 });
 
-publicRouter.post('/manage/:token/timezone', (req, res) => {
+/** Timezone and delivery hour are saved together, as one "delivery time". */
+publicRouter.post('/manage/:token/schedule', (req, res) => {
   const token = req.params.token as string;
   const subscriber = subscriberFromToken(token, 'manage');
   if (!subscriber) {
@@ -286,23 +314,35 @@ publicRouter.post('/manage/:token/timezone', (req, res) => {
     return;
   }
 
-  const parsed = TimezoneSchema.safeParse(req.body);
+  const parsed = ScheduleSchema.safeParse(req.body);
   if (!parsed.success) {
-    renderManage(res, token, { kind: 'err', text: 'Choose a timezone from the list.' });
+    renderManage(res, token, { kind: 'err', text: 'Choose a timezone and an hour from the lists.' });
     return;
   }
 
-  // setTimezone validates against the IANA list and refuses anything else, so
-  // a hand-crafted POST cannot store a bogus zone.
+  const hour = parseHourField(parsed.data.send_hour);
+  if (!hour.ok) {
+    renderManage(res, token, { kind: 'err', text: 'Choose a delivery hour from the list.' });
+    return;
+  }
+
+  // Both setters validate, so a hand-crafted POST cannot store a bogus zone or
+  // an hour outside 0-23. The hour is applied first; if the zone then turns out
+  // to be invalid nothing is half-saved, because the zone is unchanged.
   if (!setTimezone(subscriber.id, parsed.data.timezone)) {
     renderManage(res, token, { kind: 'err', text: 'That is not a timezone we recognise.' });
     return;
   }
+  setSendHour(subscriber.id, hour.hour);
 
-  const hour = String(sendHour()).padStart(2, '0');
+  const applied = hour.hour ?? defaultSendHour();
+  const padded = String(applied).padStart(2, '0');
+  const suffix = hour.hour === null ? ' (the default)' : '';
   renderManage(res, token, {
     kind: 'ok',
-    text: `Timezone saved. Your digest will arrive at ${hour}:00 ${parsed.data.timezone.replace(/_/g, ' ')}.`,
+    text:
+      `Delivery time saved. Your digest will arrive at ${padded}:00${suffix} ` +
+      `${parsed.data.timezone.replace(/_/g, ' ')}.`,
   });
 });
 

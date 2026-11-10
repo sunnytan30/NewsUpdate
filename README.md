@@ -19,7 +19,8 @@ summariser are both pluggable.
 | Name and email collected at sign-up | `src/server/routes/public.ts` |
 | Stories compared across a subscriber's sources, and cross-source agreement surfaced | `src/services/cluster.ts` |
 | Each item has a title, a thirty-second summary and a direct link | `src/services/summarise.ts`, `src/services/templates.ts` |
-| Subscriber picks their own timezone, so nobody is emailed overnight | `src/util/timezone.ts`, `src/services/subscribers.ts` |
+| Subscriber picks their own timezone and delivery hour | `src/util/timezone.ts`, `src/services/subscribers.ts` |
+| Email addresses encrypted at rest, with searchable blind index | `src/util/encryption.ts` |
 | Subject line `[YYYYMMDD] - Top News Update for [Name]` | `src/services/templates.ts` |
 | Admin console on an unguessable path, bound to one email, own password | `src/server/routes/admin.ts`, `src/services/admin.ts` |
 | Admin sets how many sources each subscriber may register | `src/server/routes/admin.ts` |
@@ -110,11 +111,15 @@ cp .env.example .env
 Generate the two secrets and the admin path:
 
 ```bash
-node -e "console.log('SESSION_SECRET='+require('crypto').randomBytes(32).toString('hex'));console.log('TOKEN_SECRET='+require('crypto').randomBytes(32).toString('hex'));console.log('ADMIN_PATH=/console-'+require('crypto').randomBytes(12).toString('hex'))"
+node -e "const r=n=>require('crypto').randomBytes(n).toString('hex');console.log('SESSION_SECRET='+r(32));console.log('TOKEN_SECRET='+r(32));console.log('ENCRYPTION_KEY='+r(32));console.log('ADMIN_PATH=/console-'+r(12))"
 ```
 
-Put those three lines into `.env`, then fill in `BASE_URL`, `ADMIN_EMAIL`, the
+Put those four lines into `.env`, then fill in `BASE_URL`, `ADMIN_EMAIL`, the
 mail provider settings and, if you are using it, `ANTHROPIC_API_KEY`.
+
+**Back up `ENCRYPTION_KEY` somewhere separate from the database before you have
+real subscribers.** Stored email addresses are encrypted with it and cannot be
+recovered without it. See [Encryption at rest](#encryption-at-rest).
 
 Build and set the admin password:
 
@@ -176,7 +181,8 @@ matter most:
 | `ADMIN_PATH` | Where the console is mounted. Long and random; at least 16 characters in production |
 | `ADMIN_EMAIL` | The only address that can sign in to the console. No default in code — set it here |
 | `SESSION_SECRET`, `TOKEN_SECRET` | 32+ characters each. Changing `TOKEN_SECRET` invalidates every manage and unsubscribe link |
-| `DEFAULT_SEND_HOUR` | Local hour each subscriber receives their digest, in *their* timezone. Default `7`. Admin-editable at runtime |
+| `ENCRYPTION_KEY` | 32 bytes. Encrypts stored email addresses. **Back it up.** Lose it and no address can be read |
+| `DEFAULT_SEND_HOUR` | Default local hour, in *their* timezone, for subscribers who do not pick one. Default `7`. Admin-editable at runtime |
 | `DEFAULT_TIMEZONE` | Zone given to a subscriber who picks none. Default `Asia/Singapore` |
 | `DIGEST_SWEEP_CRON` | How often to check who is due. Default `*/15 * * * *` |
 | `TZ` | Process timezone, for log timestamps and housekeeping only — not the send time |
@@ -199,18 +205,19 @@ the guard off entirely.
 
 ## How a subscriber uses it
 
-1. Enters name, email and timezone on `/`.
+1. Enters name, email, timezone and delivery hour on `/`. The hour can be left
+   on the default.
 2. Receives a 6-digit code, valid 15 minutes, 5 attempts, at most 3 codes per
    15 minutes per address.
 3. On the correct code the address becomes active and they land on a private
    `/manage/<signed-token>` page.
 4. They add up to their quota of `https://` sources — a homepage, a section
    page or a feed URL all work.
-5. Each morning, at the send hour in **their own** timezone, they get one
-   email. Every email carries manage and unsubscribe links, plus
-   `List-Unsubscribe` headers for one-click unsubscribe.
-6. They can change their timezone at any time from the manage page — useful if
-   they move, or are away for a stretch.
+5. Each day, at **their** hour in **their own** timezone, they get one email.
+   Every email carries manage and unsubscribe links, plus `List-Unsubscribe`
+   headers for one-click unsubscribe.
+6. They can change the hour and the timezone at any time from the manage page —
+   useful if they move, or if a different time of day suits them.
 
 A story is not sent to the same person twice within 14 days.
 
@@ -218,10 +225,14 @@ A story is not sent to the same person twice within 14 days.
 
 ## Scheduling and timezones
 
-Each subscriber receives their digest at the send hour **in their own
-timezone** — 07:00 by default. 07:00 in Singapore for a Singapore subscriber,
-07:00 in London for a London subscriber. The send hour is one global setting the
-admin controls; the timezone is per subscriber.
+Each subscriber receives their digest at **their own hour, in their own
+timezone**. 07:00 in Singapore for a Singapore subscriber, 07:00 in London for
+a London subscriber, 18:00 for someone who would rather read in the evening.
+
+Both are per subscriber. The hour follows the same override pattern as the
+source limit: a subscriber who has not chosen one tracks the admin's global
+default, so changing that default moves everyone who never picked, and nobody
+who did. A single sweep can therefore serve several different hours at once.
 
 There is therefore no single daily cron. Instead the service **sweeps** every 15
 minutes and asks which subscribers have reached their own send hour. A sweep
@@ -235,10 +246,12 @@ including the offsets that are not whole hours — India at +05:30, Nepal at
 half an hour late. Daylight saving is handled by the IANA database via `Intl`,
 so 07:00 local stays 07:00 local across transitions.
 
-**Catch-up.** If the service is down at a subscriber's send hour, the next sweep
+**Catch-up.** If the service is down at a subscriber's hour, the next sweep
 still sends, provided their local time is within four hours of it. After that
 the day is skipped rather than delivered at a strange hour — the point of the
-feature is that nobody is woken at 2am, and a late catch-up would undo it.
+feature is that the digest arrives when they expect it, and a late catch-up
+would undo that. The window never crosses midnight, so a 23:00 subscriber is
+not emailed at 02:00.
 "Already sent today" is judged on the subscriber's own local calendar date, so
 a subscriber gets exactly one digest per local day.
 
@@ -262,11 +275,8 @@ A subscriber whose stored timezone is somehow unrecognised (a hand-edited
 database, or a zone the runtime later drops) falls back to `DEFAULT_TIMEZONE`
 rather than being skipped silently.
 
-### Possible extension
-
-The send hour is global. If you later want each subscriber to choose their own
-hour as well as their zone, it is one more column on `subscribers` and one more
-field in `isDue` — the sweep architecture already supports it.
+A subscriber who picks an hour in the small hours gets it then: it is their
+inbox, and the admin default protects everyone who expresses no preference.
 
 ---
 
@@ -300,6 +310,66 @@ different `utm_*` tags is recognised as one.
 
 ---
 
+## Encryption at rest
+
+Subscriber email addresses are stored encrypted with AES-256-GCM, a fresh
+random IV per value, under `ENCRYPTION_KEY`. The plaintext address is never
+written to the database and never appears in a URL.
+
+**What this protects against:** someone who obtains the database file — a
+stolen backup, a volume snapshot, a copied SQLite file — cannot read the
+addresses.
+
+**What it does not protect against, and should not be claimed to:** an attacker
+who compromises the running application, its environment, or the host. The
+service must decrypt addresses in order to send mail, so it necessarily holds
+the key. Treat application compromise as full exposure. The protection is real
+but specific: it is about data at rest, not about intrusion.
+
+### How lookup still works
+
+An address has to be findable — sign-up and PIN verification both look one up —
+and non-deterministic encryption cannot be used in a `WHERE` clause. So each
+row carries two values:
+
+- `email_enc` — the address, encrypted. Different ciphertext every time.
+- `email_index` — a keyed HMAC of the normalised address. Deterministic, so it
+  supports exact lookup and a `UNIQUE` constraint, while revealing nothing
+  without the key. Because it is keyed rather than a plain hash, an attacker
+  holding only the database cannot test guesses against it.
+
+The two keys are derived separately from `ENCRYPTION_KEY` via HKDF, and the
+column name is bound in as additional authenticated data, so a ciphertext
+cannot be moved from one column to another and still decrypt.
+
+Manage and unsubscribe links are bound to a 128-bit prefix of the index rather
+than to the address, so the token in a URL, a mail log or browser history no
+longer carries anyone's email.
+
+### Operational consequences
+
+- **Back up the key, separately from the database.** Losing it makes every
+  stored address permanently unreadable. The service records a short,
+  non-reversible fingerprint of the key and refuses to start against a database
+  written with a different one — otherwise every lookup would miss and sign-ups
+  would silently create duplicate records beside the unreadable originals.
+- **Rotating the key is not supported** by this codebase. It would need a
+  re-encryption pass over every row; nothing here does that.
+- **Migrating an existing database** rewrites the table and then runs `VACUUM`.
+  That matters: dropping a table frees its pages but does not erase them, so
+  without the vacuum the old plaintext stays readable in the file with a hex
+  editor. The migration logs a reminder that **backups taken before it still
+  contain plaintext** and should be replaced and destroyed.
+- `PRAGMA secure_delete = ON` is set, so a later unsubscribe or housekeeping
+  delete overwrites the row rather than leaving it on the freelist. It costs a
+  little write throughput.
+- The admin console decrypts addresses to display them, which is the point of
+  having one. A row that will not decrypt is shown as `(undecryptable)` rather
+  than breaking the page.
+- Subscriber **names are not encrypted** — only the addresses were asked for. If
+  you want names covered too, the helper is field-agnostic: add a context label
+  to `FIELD`, encrypt on write and decrypt in `hydrate`.
+
 ## Security
 
 - **Transport**: every source URL must be `https://`, port 443, no embedded
@@ -312,6 +382,8 @@ different `utm_*` tags is recognised as one.
 - **Passwords and PINs**: scrypt via Node's standard library, salted, no native
   dependency. PINs are stored hashed and consumed as soon as the attempt budget
   is spent.
+- **Personal data**: email addresses are encrypted at rest and looked up via a
+  keyed blind index; see the section above for the threat model.
 - **Admin**: single bound email, unguessable mount path, lockout for 15 minutes
   after 5 failures, 8-hour server-side sessions whose tokens are stored only as
   hashes, all invalidated on a password change.
@@ -334,12 +406,15 @@ Behind more than one instance it would need a shared store.
 npm test
 ```
 
-146 tests across URL and SSRF validation, cross-source clustering and scoring,
+182 tests across URL and SSRF validation, cross-source clustering and scoring,
 feed and HTML extraction, crypto and signed tokens, the subject-line format and
 HTML escaping, prompt-injection fencing, the subscriber and PIN lifecycle,
-admin authentication, timezone handling (including daylight saving, half-hour
-offsets, date-line rollover and the catch-up window), and end-to-end digest
-runs with the network stubbed.
+admin authentication, timezone and send-hour handling (daylight saving,
+half-hour offsets, date-line rollover, the catch-up window, per-subscriber
+hours), encryption at rest (round-trip, tamper and wrong-context rejection,
+blind-index determinism, the key fingerprint guard, and a check that the raw
+database file contains no plaintext address), and end-to-end digest runs with
+the network stubbed.
 
 ```bash
 npm run typecheck
