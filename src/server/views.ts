@@ -1,5 +1,6 @@
 import { esc } from '../util/html.js';
 import { config } from '../config.js';
+import { offsetLabel, supportedTimeZones } from '../util/timezone.js';
 import type { Source } from '../services/sources.js';
 import type { Subscriber } from '../services/subscribers.js';
 import type { DeliveryRow, RunRow } from '../services/digest.js';
@@ -97,6 +98,41 @@ function csrfField(token: string): string {
   return `<input type="hidden" name="_csrf" value="${esc(token)}">`;
 }
 
+/**
+ * Timezone picker, built from the runtime's own IANA list.
+ *
+ * The app carries no JavaScript, so the browser's zone cannot be detected
+ * automatically; the subscriber chooses, with the configured default selected.
+ * Offsets are cached per render, since computing 418 of them is not free.
+ */
+let zoneOptionsCache: { builtAt: number; html: string } | null = null;
+const ZONE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function zoneOptionsHtml(): string {
+  if (zoneOptionsCache && Date.now() - zoneOptionsCache.builtAt < ZONE_CACHE_TTL_MS) {
+    return zoneOptionsCache.html;
+  }
+  const html = supportedTimeZones()
+    .map((zone) => {
+      const offset = offsetLabel(zone);
+      const label = offset ? `${zone.replace(/_/g, ' ')} (${offset})` : zone.replace(/_/g, ' ');
+      return `<option value="${esc(zone)}">${esc(label)}</option>`;
+    })
+    .join('');
+  zoneOptionsCache = { builtAt: Date.now(), html };
+  return html;
+}
+
+function timezoneSelect(opts: { id: string; name: string; selected: string }): string {
+  // Mark the selected option without rebuilding the cached list.
+  const needle = `<option value="${esc(opts.selected)}">`;
+  const options = zoneOptionsHtml().replace(
+    needle,
+    `<option value="${esc(opts.selected)}" selected>`,
+  );
+  return `<select id="${esc(opts.id)}" name="${esc(opts.name)}">${options}</select>`;
+}
+
 // ---------------------------------------------------------------------------
 // Public pages
 // ---------------------------------------------------------------------------
@@ -106,9 +142,12 @@ export function signupPage(opts: {
   flash: Flash;
   name?: string;
   email?: string;
+  timezone?: string;
   signupsOpen: boolean;
   sourceLimit: number;
+  sendHour: number;
 }): string {
+  const hour = String(opts.sendHour).padStart(2, '0');
   const body = `
 <div class="card">
   <h1>Daily news digest</h1>
@@ -129,7 +168,18 @@ export function signupPage(opts: {
     <label for="email">Email address</label>
     <input id="email" name="email" type="email" required maxlength="254" autocomplete="email"
            value="${esc(opts.email ?? '')}">
-    <p class="hint">We send a ${''}6-digit code to confirm the address is yours.</p>
+    <p class="hint">We send a 6-digit code to confirm the address is yours.</p>
+
+    <label for="timezone">Your timezone</label>
+    ${timezoneSelect({
+      id: 'timezone',
+      name: 'timezone',
+      selected: opts.timezone ?? config.DEFAULT_TIMEZONE,
+    })}
+    <p class="hint">
+      Your digest arrives at ${esc(hour)}:00 in this timezone, so it reaches you in the morning
+      wherever you are. You can change it later.
+    </p>
 
     <button type="submit">Send me a code</button>
   </form>`
@@ -141,7 +191,7 @@ export function signupPage(opts: {
   <p class="hint">
     1. Confirm your email with the code we send.<br>
     2. Add up to ${esc(opts.sourceLimit)} news sites (https only).<br>
-    3. Receive your digest each morning. Unsubscribe from any email.
+    3. Receive your digest at ${esc(hour)}:00 your local time. Unsubscribe from any email.
   </p>
 </div>
 <footer>Already signed up? Use the manage link in any digest email.</footer>`;
@@ -212,8 +262,11 @@ export function managePage(opts: {
   subscriber: Subscriber;
   sources: Source[];
   limit: number;
+  sendHour: number;
 }): string {
   const atLimit = opts.sources.length >= opts.limit;
+  const hour = String(opts.sendHour).padStart(2, '0');
+  const offset = offsetLabel(opts.subscriber.timezone);
   const body = `
 <div class="card">
   <h1>Your sources</h1>
@@ -260,6 +313,21 @@ export function managePage(opts: {
     <button type="submit">Add source</button>
   </form>`
   }
+</div>
+
+<div class="card">
+  <h2>Delivery time</h2>
+  <p class="hint">
+    Your digest is sent at <strong>${esc(hour)}:00</strong> in your timezone, currently
+    <strong>${esc(opts.subscriber.timezone.replace(/_/g, ' '))}</strong>${offset ? ` (${esc(offset)})` : ''}.
+    Change it if you move or if you are travelling for a while.
+  </p>
+  <form method="post" action="/manage/${esc(opts.token)}/timezone">
+    ${csrfField(opts.csrf)}
+    <label for="timezone">Timezone</label>
+    ${timezoneSelect({ id: 'timezone', name: 'timezone', selected: opts.subscriber.timezone })}
+    <button type="submit">Save timezone</button>
+  </form>
 </div>
 
 <div class="card">
@@ -346,6 +414,9 @@ function subscriberRow(
     <div class="hint">Blank uses the default (${esc(row.effective_limit)}).</div>
   </td>
   <td>
+    <div class="hint">${esc(row.timezone.replace(/_/g, ' '))}</div>
+  </td>
+  <td>
     <div class="hint">${esc(row.last_digest_sent_at ?? 'never')}</div>
   </td>
   <td>
@@ -365,7 +436,13 @@ export function adminDashboard(opts: {
   flash: Flash;
   adminPath: string;
   adminEmail: string;
-  settings: { defaultSourceLimit: number; maxStories: number; signupsOpen: boolean; minSourcesForTrending: number };
+  settings: {
+    defaultSourceLimit: number;
+    maxStories: number;
+    signupsOpen: boolean;
+    minSourcesForTrending: number;
+    sendHour: number;
+  };
   subscribers: (Subscriber & { source_count: number; effective_limit: number })[];
   runs: RunRow[];
   deliveries: DeliveryRow[];
@@ -376,7 +453,8 @@ export function adminDashboard(opts: {
   <h1>Administration</h1>
   <p class="lede">
     Signed in as ${esc(opts.adminEmail)} &middot; summariser: <code>${esc(opts.summariser)}</code>
-    &middot; timezone: <code>${esc(config.TZ)}</code> &middot; schedule: <code>${esc(config.DIGEST_CRON)}</code>
+    &middot; sweep: <code>${esc(config.DIGEST_SWEEP_CRON)}</code>
+    &middot; default timezone: <code>${esc(config.DEFAULT_TIMEZONE)}</code>
   </p>
   ${flashHtml(opts.flash)}
   <form method="post" action="${esc(opts.adminPath)}/logout" class="inline">
@@ -406,6 +484,11 @@ export function adminDashboard(opts: {
                value="${esc(opts.settings.minSourcesForTrending)}" required>
       </div>
       <div>
+        <label for="send_hour">Send hour (each subscriber's local time)</label>
+        <input id="send_hour" name="send_hour" type="number" min="0" max="23"
+               value="${esc(opts.settings.sendHour)}" required>
+      </div>
+      <div>
         <label for="signups_open">Sign-ups</label>
         <select id="signups_open" name="signups_open">
           <option value="true" ${opts.settings.signupsOpen ? 'selected' : ''}>Open</option>
@@ -417,6 +500,11 @@ export function adminDashboard(opts: {
       The per-subscriber limit applies to new additions. Lowering it does not remove sources a
       subscriber has already saved.
     </p>
+    <p class="hint">
+      The send hour is applied in each subscriber's own timezone, so nobody is emailed overnight.
+      A digest missed because the service was down is still sent if the subscriber's local time is
+      within four hours of the send hour; after that it waits for the next day.
+    </p>
     <button type="submit">Save settings</button>
   </form>
 </div>
@@ -427,7 +515,7 @@ export function adminDashboard(opts: {
     opts.subscribers.length === 0
       ? '<p class="hint">No subscribers yet.</p>'
       : `<table>
-    <thead><tr><th>Person</th><th>Status</th><th>Sources</th><th>Source limit</th><th>Last digest</th><th></th></tr></thead>
+    <thead><tr><th>Person</th><th>Status</th><th>Sources</th><th>Source limit</th><th>Timezone</th><th>Last digest</th><th></th></tr></thead>
     <tbody>${opts.subscribers.map((s) => subscriberRow(s, opts.csrf, opts.adminPath)).join('')}</tbody>
   </table>`
   }

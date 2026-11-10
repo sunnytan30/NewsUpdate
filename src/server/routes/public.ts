@@ -19,7 +19,9 @@ import {
   manageToken,
   normaliseEmail,
   PIN_TTL_MINUTES,
+  sendHour,
   setStatus,
+  setTimezone,
   startSignup,
   subscriberFromToken,
 } from '../../services/subscribers.js';
@@ -32,6 +34,13 @@ export const publicRouter = Router();
 const SignupSchema = z.object({
   name: z.string().min(1).max(80),
   email: z.string().email().max(254),
+  // Validated against the IANA list in resolveTimezone; an unrecognised value
+  // falls back to the configured default rather than failing the sign-up.
+  timezone: z.string().max(64).optional(),
+});
+
+const TimezoneSchema = z.object({
+  timezone: z.string().min(1).max(64),
 });
 
 const VerifySchema = z.object({
@@ -60,6 +69,7 @@ publicRouter.get('/', (_req, res) => {
       flash: null,
       signupsOpen: getSettingBool(SETTING_KEYS.signupsOpen, true),
       sourceLimit: defaultLimit(),
+      sendHour: sendHour(),
     }),
   );
 });
@@ -69,6 +79,7 @@ publicRouter.post(
   rateLimit({ name: 'signup', max: 5, windowMs: 15 * 60_000 }),
   async (req, res) => {
     const signupsOpen = getSettingBool(SETTING_KEYS.signupsOpen, true);
+    const submittedZone = typeof req.body?.timezone === 'string' ? req.body.timezone : undefined;
     const render = (flash: Flash, name?: string, email?: string) =>
       res.type('html').send(
         signupPage({
@@ -76,8 +87,10 @@ publicRouter.post(
           flash,
           name,
           email,
+          timezone: submittedZone,
           signupsOpen,
           sourceLimit: defaultLimit(),
+          sendHour: sendHour(),
         }),
       );
 
@@ -103,7 +116,7 @@ publicRouter.post(
     }
 
     const email = normaliseEmail(parsed.data.email);
-    const outcome = startSignup(name, email);
+    const outcome = startSignup(name, email, parsed.data.timezone);
 
     if (outcome.kind === 'pin-sent') {
       const mail = verificationEmail({
@@ -204,6 +217,7 @@ function renderManage(res: Response, token: string, flash: Flash): void {
       subscriber,
       sources: listSources(subscriber.id),
       limit: effectiveSourceLimit(subscriber),
+      sendHour: sendHour(),
     }),
   );
 }
@@ -260,6 +274,36 @@ publicRouter.post('/manage/:token/sources/:id/delete', (req, res) => {
       ? { kind: 'ok', text: 'Source removed.' }
       : { kind: 'err', text: 'That source could not be found.' },
   );
+});
+
+publicRouter.post('/manage/:token/timezone', (req, res) => {
+  const token = req.params.token as string;
+  const subscriber = subscriberFromToken(token, 'manage');
+  if (!subscriber) {
+    res.status(404).type('html').send(
+      noticePage({ title: 'Link not valid', message: 'That link is not valid.', kind: 'err' }),
+    );
+    return;
+  }
+
+  const parsed = TimezoneSchema.safeParse(req.body);
+  if (!parsed.success) {
+    renderManage(res, token, { kind: 'err', text: 'Choose a timezone from the list.' });
+    return;
+  }
+
+  // setTimezone validates against the IANA list and refuses anything else, so
+  // a hand-crafted POST cannot store a bogus zone.
+  if (!setTimezone(subscriber.id, parsed.data.timezone)) {
+    renderManage(res, token, { kind: 'err', text: 'That is not a timezone we recognise.' });
+    return;
+  }
+
+  const hour = String(sendHour()).padStart(2, '0');
+  renderManage(res, token, {
+    kind: 'ok',
+    text: `Timezone saved. Your digest will arrive at ${hour}:00 ${parsed.data.timezone.replace(/_/g, ' ')}.`,
+  });
 });
 
 publicRouter.post('/manage/:token/unsubscribe', (req, res) => {

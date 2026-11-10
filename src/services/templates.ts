@@ -11,8 +11,12 @@ export type DigestStory = {
   trending: boolean;
 };
 
-/** YYYYMMDD in the configured timezone, as required by the subject line. */
-export function dateStamp(date = new Date(), timeZone = config.TZ): string {
+/**
+ * YYYYMMDD in the subscriber's own timezone, as required by the subject line.
+ * Using their zone rather than the server's means the date in the subject
+ * matches the morning they actually receive it.
+ */
+export function dateStamp(date = new Date(), timeZone = config.DEFAULT_TIMEZONE): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone,
     year: 'numeric',
@@ -24,7 +28,7 @@ export function dateStamp(date = new Date(), timeZone = config.TZ): string {
 }
 
 /** Long-form date for the email body, e.g. "Monday, 10 November 2026". */
-export function readableDate(date = new Date(), timeZone = config.TZ): string {
+export function readableDate(date = new Date(), timeZone = config.DEFAULT_TIMEZONE): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone,
     weekday: 'long',
@@ -35,8 +39,12 @@ export function readableDate(date = new Date(), timeZone = config.TZ): string {
 }
 
 /** The subject line: "[YYYYMMDD] - Top News Update for [Name]". */
-export function digestSubject(name: string, date = new Date()): string {
-  return `[${dateStamp(date)}] - Top News Update for ${name}`;
+export function digestSubject(
+  name: string,
+  date = new Date(),
+  timeZone = config.DEFAULT_TIMEZONE,
+): string {
+  return `[${dateStamp(date, timeZone)}] - Top News Update for ${name}`;
 }
 
 const FONT =
@@ -151,9 +159,12 @@ export function digestEmail(opts: {
   manageUrl: string;
   unsubscribeUrl: string;
   date?: Date;
+  /** The recipient's timezone; both dates in the email are rendered in it. */
+  timeZone?: string;
 }): { subject: string; html: string; text: string } {
   const date = opts.date ?? new Date();
-  const subject = digestSubject(opts.name, date);
+  const timeZone = opts.timeZone ?? config.DEFAULT_TIMEZONE;
+  const subject = digestSubject(opts.name, date, timeZone);
   const trendingCount = opts.stories.filter((s) => s.trending).length;
 
   const intro =
@@ -164,7 +175,7 @@ export function digestEmail(opts: {
   const html = shell(
     `<tr><td style="padding:26px 28px 6px;">
   <p style="margin:0;font-size:12px;letter-spacing:1px;text-transform:uppercase;color:#6b7280;">
-    ${esc(readableDate(date))}
+    ${esc(readableDate(date, timeZone))}
   </p>
   <h1 style="margin:6px 0 0;font-size:22px;color:#111827;">Top News Update for ${esc(opts.name)}</h1>
   <p style="margin:10px 0 0;font-size:14px;line-height:1.6;color:#6b7280;">${esc(intro)}</p>
@@ -186,7 +197,7 @@ ${opts.stories.map((s, i) => storyHtml(s, i)).join('\n')}
 
   const text = [
     `Top News Update for ${opts.name}`,
-    readableDate(date),
+    readableDate(date, timeZone),
     '',
     ...opts.stories.flatMap((story, i) => [
       `${i + 1}. ${story.title}`,

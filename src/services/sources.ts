@@ -100,14 +100,24 @@ export function recordFetchOutcome(
   ).run(outcome.status, outcome.error ?? null, outcome.feedUrl ?? null, sourceId);
 }
 
-/** Every distinct active source across all active subscribers, fetched once per run. */
-export function distinctActiveSources(): Source[] {
+/**
+ * Active sources belonging to the given subscribers, fetched once per run.
+ *
+ * Scoped to the subscribers actually due in this sweep: with per-subscriber
+ * timezones, a sweep typically serves one region, so there is no reason to
+ * fetch everybody else's sources.
+ */
+export function activeSourcesFor(subscriberIds: number[]): Source[] {
+  if (subscriberIds.length === 0) return [];
+  // better-sqlite3 has no array binding, so build the placeholder list.
+  const placeholders = subscriberIds.map(() => '?').join(', ');
   return db
     .prepare(
       `SELECT s.* FROM sources s
        JOIN subscribers sub ON sub.id = s.subscriber_id
        WHERE s.active = 1 AND sub.status = 'active'
+         AND s.subscriber_id IN (${placeholders})
        ORDER BY s.host, s.id`,
     )
-    .all() as Source[];
+    .all(...subscriberIds) as Source[];
 }

@@ -6,7 +6,14 @@ import { db, allSettings, getSettingBool, getSettingInt, setSetting, SETTING_KEY
 import { adminExists, login, logout, sessionIsValid } from '../../services/admin.js';
 import { adminDashboard, adminLoginPage, noticePage, type Flash } from '../views.js';
 import { cookieOptions, rateLimit, resetRateLimit } from '../middleware.js';
-import { effectiveSourceLimit, listSubscribers, setSourceLimit, setStatus, type Subscriber } from '../../services/subscribers.js';
+import {
+  effectiveSourceLimit,
+  listSubscribers,
+  sendHour,
+  setSourceLimit,
+  setStatus,
+  type Subscriber,
+} from '../../services/subscribers.js';
 import { recentDeliveries, recentRuns, runDigest } from '../../services/digest.js';
 import { summariserName } from '../../services/summarise.js';
 
@@ -65,6 +72,7 @@ function renderDashboard(res: Response, flash: Flash): void {
         maxStories: getSettingInt(SETTING_KEYS.maxStoriesPerEmail, config.MAX_STORIES_PER_EMAIL),
         signupsOpen: getSettingBool(SETTING_KEYS.signupsOpen, true),
         minSourcesForTrending: getSettingInt(SETTING_KEYS.minSourcesForTrending, 2),
+        sendHour: sendHour(),
       },
       subscribers: subscribersWithCounts(),
       runs: recentRuns(15),
@@ -152,6 +160,8 @@ const SettingsSchema = z.object({
   default_source_limit: z.coerce.number().int().min(1).max(100),
   max_stories: z.coerce.number().int().min(1).max(30),
   min_sources_trending: z.coerce.number().int().min(2).max(20),
+  // Applied in each subscriber's own timezone, so any hour is defensible.
+  send_hour: z.coerce.number().int().min(0).max(23),
   signups_open: z.enum(['true', 'false']),
 });
 
@@ -164,6 +174,7 @@ adminRouter.post('/settings', requireAdmin, (req, res) => {
   setSetting(SETTING_KEYS.defaultSourceLimit, String(parsed.data.default_source_limit));
   setSetting(SETTING_KEYS.maxStoriesPerEmail, String(parsed.data.max_stories));
   setSetting(SETTING_KEYS.minSourcesForTrending, String(parsed.data.min_sources_trending));
+  setSetting(SETTING_KEYS.sendHour, String(parsed.data.send_hour));
   setSetting(SETTING_KEYS.signupsOpen, parsed.data.signups_open);
   log.info('admin updated settings', parsed.data);
   renderDashboard(res, { kind: 'ok', text: 'Settings saved.' });
@@ -219,8 +230,10 @@ adminRouter.post('/run-now', requireAdmin, (_req, res) => {
   }
   manualRunInFlight = true;
 
+  // Forced: an explicit "run now" should send to everyone, not only those whose
+  // local clock happens to have reached the send hour.
   // Fire and forget: a run can take minutes, far longer than a request should.
-  void runDigest()
+  void runDigest({ force: true })
     .catch((error: unknown) => {
       log.error('manual digest run failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -232,6 +245,8 @@ adminRouter.post('/run-now', requireAdmin, (_req, res) => {
 
   renderDashboard(res, {
     kind: 'ok',
-    text: 'Digest run started. Reload this page in a minute to see the result.',
+    text:
+      'Digest run started for every active subscriber, ignoring their local send time. ' +
+      'Reload this page in a minute to see the result.',
   });
 });

@@ -1,9 +1,9 @@
 # NewsUpdate
 
-A daily news digest. Subscribers register their own HTTPS news sources; each
-morning the service fetches them, works out which stories are corroborated
-across more than one of those sources, writes a thirty-second summary of each,
-and emails the result.
+A daily news digest. Subscribers register their own HTTPS news sources and their
+timezone; each morning — 07:00 their local time — the service fetches those
+sources, works out which stories are corroborated across more than one of them,
+writes a thirty-second summary of each, and emails the result.
 
 Self-contained Node.js and TypeScript: Express, SQLite, an in-process
 scheduler. No managed services required, and the email provider and the
@@ -19,6 +19,7 @@ summariser are both pluggable.
 | Name and email collected at sign-up | `src/server/routes/public.ts` |
 | Stories compared across a subscriber's sources, and cross-source agreement surfaced | `src/services/cluster.ts` |
 | Each item has a title, a thirty-second summary and a direct link | `src/services/summarise.ts`, `src/services/templates.ts` |
+| Subscriber picks their own timezone, so nobody is emailed overnight | `src/util/timezone.ts`, `src/services/subscribers.ts` |
 | Subject line `[YYYYMMDD] - Top News Update for [Name]` | `src/services/templates.ts` |
 | Admin console on an unguessable path, bound to one email, own password | `src/server/routes/admin.ts`, `src/services/admin.ts` |
 | Admin sets how many sources each subscriber may register | `src/server/routes/admin.ts` |
@@ -175,7 +176,10 @@ matter most:
 | `ADMIN_PATH` | Where the console is mounted. Long and random; at least 16 characters in production |
 | `ADMIN_EMAIL` | The only address that can sign in to the console. No default in code — set it here |
 | `SESSION_SECRET`, `TOKEN_SECRET` | 32+ characters each. Changing `TOKEN_SECRET` invalidates every manage and unsubscribe link |
-| `DIGEST_CRON`, `TZ` | Send schedule. Default `0 7 * * *` in `Asia/Singapore` |
+| `DEFAULT_SEND_HOUR` | Local hour each subscriber receives their digest, in *their* timezone. Default `7`. Admin-editable at runtime |
+| `DEFAULT_TIMEZONE` | Zone given to a subscriber who picks none. Default `Asia/Singapore` |
+| `DIGEST_SWEEP_CRON` | How often to check who is due. Default `*/15 * * * *` |
+| `TZ` | Process timezone, for log timestamps and housekeeping only — not the send time |
 | `DEFAULT_SOURCE_LIMIT` | Starting quota. The admin console overrides it, globally and per subscriber |
 | `ALLOW_PRIVATE_NETWORK` | Leave `false`. `true` disables the SSRF guard |
 
@@ -195,38 +199,83 @@ the guard off entirely.
 
 ## How a subscriber uses it
 
-1. Enters name and email on `/`.
+1. Enters name, email and timezone on `/`.
 2. Receives a 6-digit code, valid 15 minutes, 5 attempts, at most 3 codes per
    15 minutes per address.
 3. On the correct code the address becomes active and they land on a private
    `/manage/<signed-token>` page.
 4. They add up to their quota of `https://` sources — a homepage, a section
    page or a feed URL all work.
-5. Each morning they get one email. Every email carries manage and unsubscribe
-   links, plus `List-Unsubscribe` headers for one-click unsubscribe.
+5. Each morning, at the send hour in **their own** timezone, they get one
+   email. Every email carries manage and unsubscribe links, plus
+   `List-Unsubscribe` headers for one-click unsubscribe.
+6. They can change their timezone at any time from the manage page — useful if
+   they move, or are away for a stretch.
 
 A story is not sent to the same person twice within 14 days.
 
 ---
 
-## Scheduling
+## Scheduling and timezones
 
-The scheduler runs in-process by default and will not start a run while one is
-still going. To drive it externally instead, set `ENABLE_SCHEDULER=false` and
-run:
+Each subscriber receives their digest at the send hour **in their own
+timezone** — 07:00 by default. 07:00 in Singapore for a Singapore subscriber,
+07:00 in London for a London subscriber. The send hour is one global setting the
+admin controls; the timezone is per subscriber.
+
+There is therefore no single daily cron. Instead the service **sweeps** every 15
+minutes and asks which subscribers have reached their own send hour. A sweep
+with nobody due runs one SQL query, contacts no publisher and creates no run
+record, so sweeping often is cheap. When someone is due, only *their* sources
+are fetched.
+
+15 minutes is deliberate: it lands exactly on :00 local in every zone,
+including the offsets that are not whole hours — India at +05:30, Nepal at
++05:45, parts of Australia at +08:45. An hourly sweep would serve those zones
+half an hour late. Daylight saving is handled by the IANA database via `Intl`,
+so 07:00 local stays 07:00 local across transitions.
+
+**Catch-up.** If the service is down at a subscriber's send hour, the next sweep
+still sends, provided their local time is within four hours of it. After that
+the day is skipped rather than delivered at a strange hour — the point of the
+feature is that nobody is woken at 2am, and a late catch-up would undo it.
+"Already sent today" is judged on the subscriber's own local calendar date, so
+a subscriber gets exactly one digest per local day.
+
+To drive the sweep from an external cron instead, set `ENABLE_SCHEDULER=false`
+and run this on the same cadence as `DIGEST_SWEEP_CRON`:
 
 ```bash
 npm run digest:run
 ```
 
-The admin console also has a "Run a digest now" button.
+To send to everyone immediately, ignoring local times:
+
+```bash
+npm run digest:run -- --force
+```
+
+The admin console's "Run a digest now" button is the forced variant. Use it for
+testing; the scheduled sweep never forces.
+
+A subscriber whose stored timezone is somehow unrecognised (a hand-edited
+database, or a zone the runtime later drops) falls back to `DEFAULT_TIMEZONE`
+rather than being skipped silently.
+
+### Possible extension
+
+The send hour is global. If you later want each subscriber to choose their own
+hour as well as their zone, it is one more column on `subscribers` and one more
+field in `isDue` — the sweep architecture already supports it.
 
 ---
 
 ## How the pipeline works
 
 ```
-distinct active sources
+sweep (every 15 min)
+   -> which subscribers have reached their own send hour? none -> stop here
+   -> their distinct active sources
    -> fetch each URL once per run (robots.txt respected, per-host throttle,
       byte cap, timeout, redirect hops re-validated)
    -> prefer an advertised RSS/Atom feed; fall back to reading the page
@@ -239,7 +288,10 @@ distinct active sources
 ```
 
 Sources shared between subscribers are fetched once, and a summary produced for
-one subscriber is reused for the others in the same run.
+one subscriber is reused for the others in the same run. A subscriber with
+nothing new is stamped for their local day, so later sweeps inside the
+catch-up window do not re-fetch their sources to find the same nothing. A send
+*failure* is deliberately not stamped, so the next sweep retries.
 
 Clustering merges articles that share a canonical URL, or whose headlines share
 at least two distinctive words with an overlap coefficient of 0.5 or more.
@@ -282,10 +334,12 @@ Behind more than one instance it would need a shared store.
 npm test
 ```
 
-109 tests across URL and SSRF validation, cross-source clustering and scoring,
+146 tests across URL and SSRF validation, cross-source clustering and scoring,
 feed and HTML extraction, crypto and signed tokens, the subject-line format and
 HTML escaping, prompt-injection fencing, the subscriber and PIN lifecycle,
-admin authentication, and an end-to-end digest run with the network stubbed.
+admin authentication, timezone handling (including daylight saving, half-hour
+offsets, date-line rollover and the catch-up window), and end-to-end digest
+runs with the network stubbed.
 
 ```bash
 npm run typecheck
@@ -295,6 +349,11 @@ npm run typecheck
 
 ## Operational notes
 
+- Adding a column to `schema.sql` does not alter an existing database, because
+  the schema uses `CREATE TABLE IF NOT EXISTS`. `applyMigrations` in
+  `src/db/index.ts` holds the guarded `ALTER TABLE` statements for columns
+  added later; it is idempotent and runs on every boot. Existing subscribers
+  picked up `DEFAULT_TIMEZONE` when the timezone column was added.
 - Housekeeping runs after each digest: article rows older than 14 days, send
   history older than 60 days, PINs older than 7 days, expired admin sessions,
   and delivery logs older than 90 days.

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { z } from 'zod';
 import crypto from 'node:crypto';
+import { isValidTimeZone } from './util/timezone.js';
 
 const bool = (def: boolean) =>
   z
@@ -46,8 +47,18 @@ const Schema = z.object({
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default('claude-opus-5-5'),
 
+  // Process timezone, used for log timestamps and the housekeeping schedule.
   TZ: z.string().default('Asia/Singapore'),
-  DIGEST_CRON: z.string().default('0 7 * * *'),
+  // Timezone assigned to a new subscriber who does not pick one.
+  DEFAULT_TIMEZONE: z.string().optional(),
+  // Local hour (0-23) at which each subscriber receives their digest, in their
+  // own timezone. Admin-editable at runtime; this is only the seed value.
+  DEFAULT_SEND_HOUR: int(7),
+  // How often to check whether any subscriber has reached their send hour.
+  // A sweep with nobody due costs one query and fetches nothing.
+  DIGEST_SWEEP_CRON: z.string().default('*/15 * * * *'),
+  // Replaced by DIGEST_SWEEP_CRON + DEFAULT_SEND_HOUR; warned about below.
+  DIGEST_CRON: z.string().optional(),
   ENABLE_SCHEDULER: bool(true),
   DEFAULT_SOURCE_LIMIT: int(5),
   MAX_STORIES_PER_EMAIL: int(8),
@@ -108,6 +119,32 @@ if (isProd && raw.MAIL_PROVIDER === 'console') {
   process.exit(1);
 }
 
+if (raw.DIGEST_CRON) {
+  console.warn(
+    '[config] DIGEST_CRON is no longer used and is being ignored. Digests are now sent at ' +
+      'DEFAULT_SEND_HOUR in each subscriber\'s own timezone; DIGEST_SWEEP_CRON controls how ' +
+      'often the service checks who is due.',
+  );
+}
+
+if (raw.DEFAULT_SEND_HOUR < 0 || raw.DEFAULT_SEND_HOUR > 23) {
+  console.error('DEFAULT_SEND_HOUR must be between 0 and 23.');
+  process.exit(1);
+}
+
+/** The timezone given to a subscriber who does not choose one. */
+const defaultTimezone = (() => {
+  const candidate = raw.DEFAULT_TIMEZONE?.trim() || raw.TZ.trim();
+  if (isValidTimeZone(candidate)) return candidate;
+  const field = raw.DEFAULT_TIMEZONE ? 'DEFAULT_TIMEZONE' : 'TZ';
+  if (isProd) {
+    console.error(`${field} is not a recognised IANA timezone: ${candidate}`);
+    process.exit(1);
+  }
+  console.warn(`[config] ${field} ("${candidate}") is not recognised; falling back to Asia/Singapore.`);
+  return 'Asia/Singapore';
+})();
+
 export const config = {
   ...raw,
   isProd,
@@ -116,6 +153,7 @@ export const config = {
   /** Normalised admin mount path, without a trailing slash. */
   ADMIN_PATH: raw.ADMIN_PATH.replace(/\/+$/, '') || '/console',
   ADMIN_EMAIL: raw.ADMIN_EMAIL.trim().toLowerCase(),
+  DEFAULT_TIMEZONE: defaultTimezone,
 };
 
 export type Config = typeof config;

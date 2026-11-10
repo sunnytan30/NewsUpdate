@@ -9,12 +9,16 @@ import { digestEmail, type DigestStory } from './templates.js';
 import { sendMail } from './mailer.js';
 import {
   activeSubscribers,
+  dueSubscribers,
   manageUrl,
+  markDigestConsidered,
   markDigestSent,
+  resolveTimezone,
+  sendHour,
   unsubscribeUrl,
   type Subscriber,
 } from './subscribers.js';
-import { activeSources, distinctActiveSources, recordFetchOutcome, type Source } from './sources.js';
+import { activeSources, activeSourcesFor, recordFetchOutcome, type Source } from './sources.js';
 
 export type RunSummary = {
   runId: number;
@@ -24,6 +28,18 @@ export type RunSummary = {
   emailsSent: number;
   emailsFailed: number;
   subscribersSkipped: number;
+  /** Subscribers considered in this run (those due, or all when forced). */
+  subscribersConsidered: number;
+};
+
+export type RunOptions = {
+  /**
+   * Send to every active subscriber regardless of their local time. Used by
+   * the admin's "run now" button and `digest:run --force`; the scheduled sweep
+   * never forces, or subscribers would be emailed at the wrong hour.
+   */
+  force?: boolean;
+  now?: Date;
 };
 
 /** Keep repeat-suppression bounded so a story can resurface after a fortnight. */
@@ -38,7 +54,12 @@ function startRun(): number {
   return Number(info.lastInsertRowid);
 }
 
-function finishRun(runId: number, stats: Omit<RunSummary, 'runId' | 'subscribersSkipped'>, error?: string) {
+type RunStats = Pick<
+  RunSummary,
+  'sourcesFetched' | 'sourcesFailed' | 'articlesFound' | 'emailsSent' | 'emailsFailed'
+>;
+
+function finishRun(runId: number, stats: RunStats, error?: string) {
   db.prepare(
     `UPDATE digest_runs
      SET finished_at = datetime('now'),
@@ -134,8 +155,9 @@ function prune(): void {
  */
 async function fetchAllSources(
   runId: number,
+  subscriberIds: number[],
 ): Promise<{ bySourceId: Map<number, RawArticle[]>; fetched: number; failed: number; total: number }> {
-  const sources = distinctActiveSources();
+  const sources = activeSourcesFor(subscriberIds);
   const byUrl = new Map<string, Source[]>();
   for (const source of sources) {
     const bucket = byUrl.get(source.url);
@@ -278,22 +300,50 @@ async function buildForSubscriber(
   return { stories, storyKeys: selected.map((s) => s.storyKey) };
 }
 
-/** Run the whole daily digest: fetch, cluster, summarise, send. */
-export async function runDigest(): Promise<RunSummary> {
-  const runId = startRun();
-  log.info('digest run started', { runId, summariser: summariserName() });
+/**
+ * Run the digest: fetch, cluster, summarise, send.
+ *
+ * Called on every sweep. It first works out who is actually due in their own
+ * timezone, and returns immediately if that is nobody — so a sweep that serves
+ * no one costs a single query and fetches nothing from any publisher.
+ */
+export async function runDigest(options: RunOptions = {}): Promise<RunSummary> {
+  const now = options.now ?? new Date();
+  const recipients = options.force ? activeSubscribers() : dueSubscribers(now);
 
-  const stats = {
+  const stats: RunStats = {
     sourcesFetched: 0,
     sourcesFailed: 0,
     articlesFound: 0,
     emailsSent: 0,
     emailsFailed: 0,
   };
+
+  if (recipients.length === 0) {
+    log.debug('sweep found nobody due', { sendHour: sendHour() });
+    return {
+      runId: 0,
+      ...stats,
+      subscribersSkipped: 0,
+      subscribersConsidered: 0,
+    };
+  }
+
+  const runId = startRun();
+  log.info('digest run started', {
+    runId,
+    summariser: summariserName(),
+    recipients: recipients.length,
+    forced: options.force === true,
+  });
+
   let skipped = 0;
 
   try {
-    const fetchResult = await fetchAllSources(runId);
+    const fetchResult = await fetchAllSources(
+      runId,
+      recipients.map((s) => s.id),
+    );
     stats.sourcesFetched = fetchResult.fetched;
     stats.sourcesFailed = fetchResult.failed;
     stats.articlesFound = fetchResult.total;
@@ -301,7 +351,7 @@ export async function runDigest(): Promise<RunSummary> {
     const bodyCache = new Map<string, string>();
     const summaryCache = new Map<string, { title: string; summary: string }>();
 
-    for (const subscriber of activeSubscribers()) {
+    for (const subscriber of recipients) {
       try {
         const { stories, storyKeys } = await buildForSubscriber(
           subscriber,
@@ -312,6 +362,9 @@ export async function runDigest(): Promise<RunSummary> {
 
         if (stories.length === 0) {
           skipped++;
+          // Stamp their local day so later sweeps in the catch-up window do
+          // not re-fetch their sources to find the same nothing.
+          if (!options.force) markDigestConsidered(subscriber, now);
           logDelivery(runId, subscriber.id, '(no stories)', 0, 'skipped', 'nothing new to send');
           log.info('nothing to send', { subscriberId: subscriber.id });
           continue;
@@ -322,6 +375,9 @@ export async function runDigest(): Promise<RunSummary> {
           stories,
           manageUrl: manageUrl(subscriber),
           unsubscribeUrl: unsubscribeUrl(subscriber),
+          date: now,
+          // Dates in the subject and body are rendered in the recipient's zone.
+          timeZone: resolveTimezone(subscriber.timezone),
         });
 
         const sendResult = await sendMail({
@@ -335,7 +391,7 @@ export async function runDigest(): Promise<RunSummary> {
         if (sendResult.ok) {
           stats.emailsSent++;
           recordSent(subscriber.id, storyKeys);
-          markDigestSent(subscriber.id);
+          markDigestSent(subscriber, now);
           logDelivery(runId, subscriber.id, mail.subject, stories.length, 'sent');
           log.info('digest sent', { subscriberId: subscriber.id, stories: stories.length });
         } else {
@@ -353,8 +409,14 @@ export async function runDigest(): Promise<RunSummary> {
 
     prune();
     finishRun(runId, stats);
-    log.info('digest run finished', { runId, ...stats, subscribersSkipped: skipped });
-    return { runId, ...stats, subscribersSkipped: skipped };
+    const summary: RunSummary = {
+      runId,
+      ...stats,
+      subscribersSkipped: skipped,
+      subscribersConsidered: recipients.length,
+    };
+    log.info('digest run finished', summary);
+    return summary;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     finishRun(runId, stats, message);

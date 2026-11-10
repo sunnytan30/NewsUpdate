@@ -14,10 +14,16 @@ CREATE TABLE IF NOT EXISTS subscribers (
                               CHECK (status IN ('pending', 'active', 'unsubscribed')),
   -- NULL means "use the global default from settings".
   source_limit        INTEGER,
+  -- IANA timezone name. The digest is sent at the configured local hour in
+  -- this zone, so a subscriber abroad is not woken in the middle of the night.
+  timezone            TEXT    NOT NULL DEFAULT 'Asia/Singapore',
   created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
   verified_at         TEXT,
   unsubscribed_at     TEXT,
-  last_digest_sent_at TEXT
+  last_digest_sent_at TEXT,
+  -- Local calendar date (YYYY-MM-DD, in `timezone`) of the last digest sent.
+  -- This is what stops a second send on the same local day.
+  last_digest_local_date TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers (status);
